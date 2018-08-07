@@ -107,6 +107,8 @@ mod back {
     pub mod wasm;
 }
 
+mod traits;
+
 mod abi;
 mod allocator;
 mod asm;
