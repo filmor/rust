@@ -20,6 +20,7 @@ use rustc::ty::layout::{Align, Size};
 use rustc::session::{config, Session};
 use rustc_data_structures::small_c_str::SmallCStr;
 use traits::{self, BuilderMethods};
+use syntax;
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -732,7 +733,7 @@ impl BuilderMethods<'a, 'll, 'tcx, Value, BasicBlock>
     fn inline_asm_call(&self, asm: *const c_char, cons: *const c_char,
                          inputs: &[&'ll Value], output: &'ll Type,
                          volatile: bool, alignstack: bool,
-                         dia: AsmDialect) -> &'ll Value {
+                         dia: syntax::ast::AsmDialect) -> &'ll Value {
         self.count_insn("inlineasm");
 
         let volatile = if volatile { llvm::True }
@@ -749,7 +750,7 @@ impl BuilderMethods<'a, 'll, 'tcx, Value, BasicBlock>
         let fty = Type::func::<Value>(&argtys[..], output);
         unsafe {
             let v = llvm::LLVMRustInlineAsm(
-                fty, asm, cons, volatile, alignstack, dia);
+                fty, asm, cons, volatile, alignstack, AsmDialect::from_generic(dia));
             self.call(v, inputs, None)
         }
     }

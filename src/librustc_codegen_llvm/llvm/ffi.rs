@@ -26,6 +26,7 @@ use libc::{c_ulonglong, c_void};
 
 use std::marker::PhantomData;
 use traits;
+use syntax;
 
 use super::RustString;
 
@@ -357,6 +358,15 @@ pub enum AsmDialect {
     Other,
     Att,
     Intel,
+}
+
+impl AsmDialect {
+    pub fn from_generic(asm : syntax::ast::AsmDialect) -> Self {
+        match asm {
+            syntax::ast::AsmDialect::Att => AsmDialect::Att,
+            syntax::ast::AsmDialect::Intel => AsmDialect::Intel
+        }
+    }
 }
 
 /// LLVMRustCodeGenOptLevel
