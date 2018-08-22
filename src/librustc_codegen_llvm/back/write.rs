@@ -48,7 +48,6 @@ use context::{is_pie_binary, get_reloc_model};
 use common::{C_bytes_in_context, val_ty};
 use jobserver::{Client, Acquired};
 use rustc_demangle;
-use value::Value;
 
 use std::any::Any;
 use std::ffi::{CString, CStr};
@@ -2538,7 +2537,7 @@ fn create_msvc_imps(cgcx: &CodegenContext, llcx: &llvm::Context, llmod: &llvm::M
         "\x01__imp_"
     };
     unsafe {
-        let i8p_ty = Type::i8p_llcx::<Value>(llcx);
+        let i8p_ty = Type::i8p_llcx(llcx);
         let globals = base::iter_globals(llmod)
             .filter(|&val| {
                 llvm::LLVMRustGetLinkage(val) == llvm::Linkage::ExternalLinkage &&
