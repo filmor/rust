@@ -76,7 +76,7 @@ impl OperandRef<'tcx, &'ll Value> {
                    layout: TyLayout<'tcx>) -> OperandRef<'tcx, &'ll Value> {
         assert!(layout.is_zst());
         OperandRef {
-            val: OperandValue::Immediate(CodegenCx::c_undef(layout.immediate_llvm_type(cx))),
+            val: OperandValue::Immediate(cx.c_undef(layout.immediate_llvm_type(cx))),
             layout
         }
     }
@@ -124,7 +124,7 @@ impl OperandRef<'tcx, &'ll Value> {
                         b_scalar,
                         b_layout,
                     ),
-                    ScalarMaybeUndef::Undef => CodegenCx::c_undef(b_layout),
+                    ScalarMaybeUndef::Undef => bx.cx().c_undef(b_layout),
                 };
                 OperandValue::Pair(a_llval, b_llval)
             },
@@ -173,7 +173,7 @@ impl OperandRef<'tcx, &'ll Value> {
             debug!("Operand::immediate_or_packed_pair: packing {:?} into {:?}",
                    self, llty);
             // Reconstruct the immediate aggregate.
-            let mut llpair = CodegenCx::c_undef(llty);
+            let mut llpair = bx.cx().c_undef(llty);
             llpair = bx.insert_value(llpair, base::from_immediate(bx, a), 0);
             llpair = bx.insert_value(llpair, base::from_immediate(bx, b), 1);
             llpair
@@ -237,7 +237,7 @@ impl OperandRef<'tcx, &'ll Value> {
             // `#[repr(simd)]` types are also immediate.
             (OperandValue::Immediate(llval), &layout::Abi::Vector { .. }) => {
                 OperandValue::Immediate(
-                    bx.extract_element(llval, CodegenCx::c_usize(bx.cx(), i as u64)))
+                    bx.extract_element(llval, bx.cx().c_usize(i as u64)))
             }
 
             _ => bug!("OperandRef::extract_field({:?}): not applicable", self)
@@ -465,7 +465,7 @@ impl FunctionCx<'a, 'll, 'tcx, &'ll Value> {
                         // We've errored, so we don't have to produce working code.
                         let layout = bx.cx().layout_of(ty);
                         PlaceRef::new_sized(
-                            CodegenCx::c_undef(layout.llvm_type(bx.cx()).ptr_to()),
+                            bx.cx().c_undef(layout.llvm_type(bx.cx()).ptr_to()),
                             layout,
                             layout.align,
                         ).load(bx)
