@@ -348,6 +348,7 @@ impl<'ll> Backend for ModuleLlvm<'ll> {
     type Value = &'ll Value;
     type BasicBlock = &'ll llvm::BasicBlock;
     type Type = &'ll Type;
+    type TypeKind = llvm::TypeKind;
     type Context = &'ll llvm::Context;
 }
 
