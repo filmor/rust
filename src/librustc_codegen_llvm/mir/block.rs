@@ -18,13 +18,15 @@ use abi::{Abi, ArgType, ArgTypeExt, FnType, FnTypeExt, LlvmType, PassMode};
 use base;
 use callee;
 use builder::{Builder, MemFlags};
-use common::{self, C_bool, C_str_slice, C_struct, C_u32, C_uint_big, C_undef};
+use common::{self, IntPredicate};
 use consts;
 use meth;
 use monomorphize;
 use type_of::LayoutLlvmExt;
 use type_::Type;
 use value::Value;
+
+use interfaces::{BuilderMethods, ConstMethods, TypeMethods};
 
 use syntax::symbol::Symbol;
 use syntax_pos::Pos;
@@ -34,7 +36,7 @@ use super::place::PlaceRef;
 use super::operand::OperandRef;
 use super::operand::OperandValue::{Pair, Ref, Immediate};
 
-impl FunctionCx<'a, 'll, 'tcx> {
+impl FunctionCx<'a, 'll, 'tcx, &'ll Value> {
     pub fn codegen_block(&mut self, bb: mir::BasicBlock) {
         let mut bx = self.build_block(bb);
         let data = &self.mir[bb];
@@ -49,7 +51,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_terminator(&mut self,
-                        mut bx: Builder<'a, 'll, 'tcx>,
+                        mut bx: Builder<'a, 'll, 'tcx, &'ll Value>,
                         bb: mir::BasicBlock,
                         terminator: &mir::Terminator<'tcx>)
     {
@@ -98,24 +100,25 @@ impl FunctionCx<'a, 'll, 'tcx> {
             }
         };
 
-        let funclet_br = |this: &mut Self, bx: Builder<'_, 'll, '_>, target: mir::BasicBlock| {
-            let (lltarget, is_cleanupret) = lltarget(this, target);
-            if is_cleanupret {
-                // micro-optimization: generate a `ret` rather than a jump
-                // to a trampoline.
-                bx.cleanup_ret(cleanup_pad.unwrap(), Some(lltarget));
-            } else {
-                bx.br(lltarget);
-            }
-        };
+        let funclet_br =
+            |this: &mut Self, bx: Builder<'_, 'll, '_, &'ll Value>, target: mir::BasicBlock| {
+                let (lltarget, is_cleanupret) = lltarget(this, target);
+                if is_cleanupret {
+                    // micro-optimization: generate a `ret` rather than a jump
+                    // to a trampoline.
+                    bx.cleanup_ret(cleanup_pad.unwrap(), Some(lltarget));
+                } else {
+                    bx.br(lltarget);
+                }
+            };
 
         let do_call = |
             this: &mut Self,
-            bx: Builder<'a, 'll, 'tcx>,
+            bx: Builder<'a, 'll, 'tcx, &'ll Value>,
             fn_ty: FnType<'tcx, Ty<'tcx>>,
             fn_ptr: &'ll Value,
             llargs: &[&'ll Value],
-            destination: Option<(ReturnDest<'ll, 'tcx>, mir::BasicBlock)>,
+            destination: Option<(ReturnDest<'tcx, &'ll Value>, mir::BasicBlock)>,
             cleanup: Option<mir::BasicBlock>
         | {
             if let Some(cleanup) = cleanup {
@@ -168,12 +171,12 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     slot.storage_dead(&bx);
 
                     if !bx.sess().target.target.options.custom_unwind_resume {
-                        let mut lp = C_undef(self.landing_pad_type());
+                        let mut lp = bx.cx().const_undef(self.landing_pad_type());
                         lp = bx.insert_value(lp, lp0, 0);
                         lp = bx.insert_value(lp, lp1, 1);
                         bx.resume(lp);
                     } else {
-                        bx.call(bx.cx.eh_unwind_resume(), &[lp0], cleanup_bundle);
+                        bx.call(bx.cx().eh_unwind_resume(), &[lp0], cleanup_bundle);
                         bx.unreachable();
                     }
                 }
@@ -181,7 +184,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
             mir::TerminatorKind::Abort => {
                 // Call core::intrinsics::abort()
-                let fnname = bx.cx.get_intrinsic(&("llvm.trap"));
+                let fnname = bx.cx().get_intrinsic(&("llvm.trap"));
                 bx.call(fnname, &[], None);
                 bx.unreachable();
             }
@@ -205,18 +208,18 @@ impl FunctionCx<'a, 'll, 'tcx> {
                             bx.cond_br(discr.immediate(), lltrue, llfalse);
                         }
                     } else {
-                        let switch_llty = bx.cx.layout_of(switch_ty).immediate_llvm_type(bx.cx);
-                        let llval = C_uint_big(switch_llty, values[0]);
-                        let cmp = bx.icmp(llvm::IntEQ, discr.immediate(), llval);
+                        let switch_llty = bx.cx().layout_of(switch_ty).immediate_llvm_type(bx.cx());
+                        let llval = bx.cx().const_uint_big(switch_llty, values[0]);
+                        let cmp = bx.icmp(IntPredicate::IntEQ, discr.immediate(), llval);
                         bx.cond_br(cmp, lltrue, llfalse);
                     }
                 } else {
                     let (otherwise, targets) = targets.split_last().unwrap();
                     let switch = bx.switch(discr.immediate(),
                                             llblock(self, *otherwise), values.len());
-                    let switch_llty = bx.cx.layout_of(switch_ty).immediate_llvm_type(bx.cx);
+                    let switch_llty = bx.cx().layout_of(switch_ty).immediate_llvm_type(bx.cx());
                     for (&value, target) in values.iter().zip(targets) {
-                        let llval = C_uint_big(switch_llty, value);
+                        let llval =bx.cx().const_uint_big(switch_llty, value);
                         let llbb = llblock(self, *target);
                         bx.add_case(switch, llval, llbb)
                     }
@@ -264,7 +267,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                             }
                         };
                         bx.load(
-                            bx.pointercast(llslot, cast_ty.llvm_type(bx.cx).ptr_to()),
+                            bx.pointercast(llslot, bx.cx().type_ptr_to(cast_ty.llvm_type(bx.cx()))),
                             self.fn_ty.ret.layout.align)
                     }
                 };
@@ -278,7 +281,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
             mir::TerminatorKind::Drop { ref location, target, unwind } => {
                 let ty = location.ty(self.mir, bx.tcx()).to_ty(bx.tcx());
                 let ty = self.monomorphize(&ty);
-                let drop_fn = monomorphize::resolve_drop_in_place(bx.cx.tcx, ty);
+                let drop_fn = monomorphize::resolve_drop_in_place(bx.cx().tcx, ty);
 
                 if let ty::InstanceDef::DropGlue(_, None) = drop_fn.def {
                     // we don't actually need to drop anything.
@@ -297,20 +300,20 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 };
                 let (drop_fn, fn_ty) = match ty.sty {
                     ty::Dynamic(..) => {
-                        let fn_ty = drop_fn.ty(bx.cx.tcx);
-                        let sig = common::ty_fn_sig(bx.cx, fn_ty);
+                        let fn_ty = drop_fn.ty(bx.cx().tcx);
+                        let sig = common::ty_fn_sig(bx.cx(), fn_ty);
                         let sig = bx.tcx().normalize_erasing_late_bound_regions(
                             ty::ParamEnv::reveal_all(),
                             &sig,
                         );
-                        let fn_ty = FnType::new_vtable(bx.cx, sig, &[]);
+                        let fn_ty = FnType::new_vtable(bx.cx(), sig, &[]);
                         let vtable = args[1];
                         args = &args[..1];
                         (meth::DESTRUCTOR.get_fn(&bx, vtable, &fn_ty), fn_ty)
                     }
                     _ => {
-                        (callee::get_fn(bx.cx, drop_fn),
-                         FnType::of_instance(bx.cx, &drop_fn))
+                        (callee::get_fn(bx.cx(), drop_fn),
+                         FnType::of_instance(bx.cx(), &drop_fn))
                     }
                 };
                 do_call(self, bx, fn_ty, drop_fn, args,
@@ -320,7 +323,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
             mir::TerminatorKind::Assert { ref cond, expected, ref msg, target, cleanup } => {
                 let cond = self.codegen_operand(&bx, cond).immediate();
-                let mut const_cond = common::const_to_opt_u128(cond, false).map(|c| c == 1);
+                let mut const_cond = bx.cx().const_to_opt_u128(cond, false).map(|c| c == 1);
 
                 // This case can currently arise only from functions marked
                 // with #[rustc_inherit_overflow_checks] and inlined from
@@ -329,7 +332,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 // NOTE: Unlike binops, negation doesn't have its own
                 // checked operation, just a comparison with the minimum
                 // value, so we have to check for the assert message.
-                if !bx.cx.check_overflow {
+                if !bx.cx().check_overflow {
                     if let mir::interpret::EvalErrorKind::OverflowNeg = *msg {
                         const_cond = Some(expected);
                     }
@@ -342,8 +345,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 }
 
                 // Pass the condition through llvm.expect for branch hinting.
-                let expect = bx.cx.get_intrinsic(&"llvm.expect.i1");
-                let cond = bx.call(expect, &[cond, C_bool(bx.cx, expected)], None);
+                let expect = bx.cx().get_intrinsic(&"llvm.expect.i1");
+                let cond = bx.call(expect, &[cond, bx.cx().const_bool(expected)], None);
 
                 // Create the failure block and the conditional branch to it.
                 let lltarget = llblock(self, target);
@@ -361,9 +364,9 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 // Get the location information.
                 let loc = bx.sess().source_map().lookup_char_pos(span.lo());
                 let filename = Symbol::intern(&loc.file.name.to_string()).as_str();
-                let filename = C_str_slice(bx.cx, filename);
-                let line = C_u32(bx.cx, loc.line as u32);
-                let col = C_u32(bx.cx, loc.col.to_usize() as u32 + 1);
+                let filename = bx.cx().const_str_slice(filename);
+                let line = bx.cx().const_u32(loc.line as u32);
+                let col = bx.cx().const_u32(loc.col.to_usize() as u32 + 1);
                 let align = tcx.data_layout.aggregate_align
                     .max(tcx.data_layout.i32_align)
                     .max(tcx.data_layout.pointer_align);
@@ -374,8 +377,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         let len = self.codegen_operand(&mut bx, len).immediate();
                         let index = self.codegen_operand(&mut bx, index).immediate();
 
-                        let file_line_col = C_struct(bx.cx, &[filename, line, col], false);
-                        let file_line_col = consts::addr_of(bx.cx,
+                        let file_line_col = bx.cx().const_struct(&[filename, line, col], false);
+                        let file_line_col = consts::addr_of(bx.cx(),
                                                             file_line_col,
                                                             align,
                                                             Some("panic_bounds_check_loc"));
@@ -385,11 +388,12 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     _ => {
                         let str = msg.description();
                         let msg_str = Symbol::intern(str).as_str();
-                        let msg_str = C_str_slice(bx.cx, msg_str);
-                        let msg_file_line_col = C_struct(bx.cx,
-                                                     &[msg_str, filename, line, col],
-                                                     false);
-                        let msg_file_line_col = consts::addr_of(bx.cx,
+                        let msg_str = bx.cx().const_str_slice(msg_str);
+                        let msg_file_line_col = bx.cx().const_struct(
+                            &[msg_str, filename, line, col],
+                            false
+                        );
+                        let msg_file_line_col = consts::addr_of(bx.cx(),
                                                                 msg_file_line_col,
                                                                 align,
                                                                 Some("panic_loc"));
@@ -401,8 +405,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 // Obtain the panic entry point.
                 let def_id = common::langcall(bx.tcx(), Some(span), "", lang_item);
                 let instance = ty::Instance::mono(bx.tcx(), def_id);
-                let fn_ty = FnType::of_instance(bx.cx, &instance);
-                let llfn = callee::get_fn(bx.cx, instance);
+                let fn_ty = FnType::of_instance(bx.cx(), &instance);
+                let llfn = callee::get_fn(bx.cx(), instance);
 
                 // Codegen the actual panic invoke/call.
                 do_call(self, bx, fn_ty, llfn, &args, None, cleanup);
@@ -418,7 +422,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
                 let (instance, mut llfn) = match callee.layout.ty.sty {
                     ty::FnDef(def_id, substs) => {
-                        (Some(ty::Instance::resolve(bx.cx.tcx,
+                        (Some(ty::Instance::resolve(bx.cx().tcx,
                                                     ty::ParamEnv::reveal_all(),
                                                     def_id,
                                                     substs).unwrap()),
@@ -457,7 +461,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         // we can do what we like. Here, we declare that transmuting
                         // into an uninhabited type is impossible, so anything following
                         // it must be unreachable.
-                        assert_eq!(bx.cx.layout_of(sig.output()).abi, layout::Abi::Uninhabited);
+                        assert_eq!(bx.cx().layout_of(sig.output()).abi, layout::Abi::Uninhabited);
                         bx.unreachable();
                     }
                     return;
@@ -471,7 +475,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
                 let fn_ty = match def {
                     Some(ty::InstanceDef::Virtual(..)) => {
-                        FnType::new_vtable(bx.cx, sig, &extra_args)
+                        FnType::new_vtable(bx.cx(), sig, &extra_args)
                     }
                     Some(ty::InstanceDef::DropGlue(_, None)) => {
                         // empty drop glue - a nop.
@@ -479,7 +483,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         funclet_br(self, bx, target);
                         return;
                     }
-                    _ => FnType::new(bx.cx, sig, &extra_args)
+                    _ => FnType::new(bx.cx(), sig, &extra_args)
                 };
 
                 // The arguments we'll be passing. Plus one to account for outptr, if used.
@@ -501,7 +505,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     let dest = match ret_dest {
                         _ if fn_ty.ret.is_indirect() => llargs[0],
                         ReturnDest::Nothing => {
-                            C_undef(fn_ty.ret.memory_ty(bx.cx).ptr_to())
+                            bx.cx().const_undef(bx.cx().type_ptr_to(fn_ty.ret.memory_ty(bx.cx())))
                         }
                         ReturnDest::IndirectOperand(dst, _) |
                         ReturnDest::Store(dst) => dst.llval,
@@ -535,7 +539,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                                     );
                                     return OperandRef {
                                         val: Immediate(llval),
-                                        layout: bx.cx.layout_of(ty),
+                                        layout: bx.cx().layout_of(ty),
                                     };
 
                                 },
@@ -553,7 +557,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                                     );
                                     return OperandRef {
                                         val: Immediate(llval),
-                                        layout: bx.cx.layout_of(ty)
+                                        layout: bx.cx().layout_of(ty)
                                     };
                                 }
                             }
@@ -563,7 +567,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     }).collect();
 
 
-                    let callee_ty = instance.as_ref().unwrap().ty(bx.cx.tcx);
+                    let callee_ty = instance.as_ref().unwrap().ty(bx.cx().tcx);
                     codegen_intrinsic_call(&bx, callee_ty, &fn_ty, &args, dest,
                                          terminator.source_info.span);
 
@@ -620,7 +624,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
                 let fn_ptr = match (llfn, instance) {
                     (Some(llfn), _) => llfn,
-                    (None, Some(instance)) => callee::get_fn(bx.cx, instance),
+                    (None, Some(instance)) => callee::get_fn(bx.cx(), instance),
                     _ => span_bug!(span, "no llfn for call"),
                 };
 
@@ -636,13 +640,13 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_argument(&mut self,
-                      bx: &Builder<'a, 'll, 'tcx>,
-                      op: OperandRef<'ll, 'tcx>,
+                      bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+                      op: OperandRef<'tcx, &'ll Value>,
                       llargs: &mut Vec<&'ll Value>,
                       arg: &ArgType<'tcx, Ty<'tcx>>) {
         // Fill padding with undef value, where applicable.
         if let Some(ty) = arg.pad {
-            llargs.push(C_undef(ty.llvm_type(bx.cx)));
+            llargs.push(bx.cx().const_undef(ty.llvm_type(bx.cx())));
         }
 
         if arg.is_ignore() {
@@ -701,7 +705,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
         if by_ref && !arg.is_indirect() {
             // Have to load the argument, maybe while casting it.
             if let PassMode::Cast(ty) = arg.mode {
-                llval = bx.load(bx.pointercast(llval, ty.llvm_type(bx.cx).ptr_to()),
+                llval = bx.load(bx.pointercast(llval, bx.cx().type_ptr_to(ty.llvm_type(bx.cx()))),
                                  align.min(arg.layout.align));
             } else {
                 // We can't use `PlaceRef::load` here because the argument
@@ -724,7 +728,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_arguments_untupled(&mut self,
-                                bx: &Builder<'a, 'll, 'tcx>,
+                                bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                                 operand: &mir::Operand<'tcx>,
                                 llargs: &mut Vec<&'ll Value>,
                                 args: &[ArgType<'tcx, Ty<'tcx>>]) {
@@ -748,8 +752,11 @@ impl FunctionCx<'a, 'll, 'tcx> {
         }
     }
 
-    fn get_personality_slot(&mut self, bx: &Builder<'a, 'll, 'tcx>) -> PlaceRef<'ll, 'tcx> {
-        let cx = bx.cx;
+    fn get_personality_slot(
+        &mut self,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>
+    ) -> PlaceRef<'tcx, &'ll Value> {
+        let cx = bx.cx();
         if let Some(slot) = self.personality_slot {
             slot
         } else {
@@ -799,7 +806,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
     fn landing_pad_type(&self) -> &'ll Type {
         let cx = self.cx;
-        Type::struct_(cx, &[Type::i8p(cx), Type::i32(cx)], false)
+        cx.type_struct( &[cx.type_i8p(), cx.type_i32()], false)
     }
 
     fn unreachable_block(&mut self) -> &'ll BasicBlock {
@@ -811,20 +818,20 @@ impl FunctionCx<'a, 'll, 'tcx> {
         })
     }
 
-    pub fn new_block(&self, name: &str) -> Builder<'a, 'll, 'tcx> {
+    pub fn new_block(&self, name: &str) -> Builder<'a, 'll, 'tcx, &'ll Value> {
         Builder::new_block(self.cx, self.llfn, name)
     }
 
-    pub fn build_block(&self, bb: mir::BasicBlock) -> Builder<'a, 'll, 'tcx> {
+    pub fn build_block(&self, bb: mir::BasicBlock) -> Builder<'a, 'll, 'tcx, &'ll Value> {
         let bx = Builder::with_cx(self.cx);
         bx.position_at_end(self.blocks[bb]);
         bx
     }
 
-    fn make_return_dest(&mut self, bx: &Builder<'a, 'll, 'tcx>,
+    fn make_return_dest(&mut self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                         dest: &mir::Place<'tcx>, fn_ret: &ArgType<'tcx, Ty<'tcx>>,
                         llargs: &mut Vec<&'ll Value>, is_intrinsic: bool)
-                        -> ReturnDest<'ll, 'tcx> {
+                        -> ReturnDest<'tcx, &'ll Value> {
         // If the return is ignored, we can just return a do-nothing ReturnDest
         if fn_ret.is_ignore() {
             return ReturnDest::Nothing;
@@ -878,7 +885,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
         }
     }
 
-    fn codegen_transmute(&mut self, bx: &Builder<'a, 'll, 'tcx>,
+    fn codegen_transmute(&mut self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                        src: &mir::Operand<'tcx>,
                        dst: &mir::Place<'tcx>) {
         if let mir::Place::Local(index) = *dst {
@@ -886,7 +893,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 LocalRef::Place(place) => self.codegen_transmute_into(bx, src, place),
                 LocalRef::UnsizedPlace(_) => bug!("transmute must not involve unsized locals"),
                 LocalRef::Operand(None) => {
-                    let dst_layout = bx.cx.layout_of(self.monomorphized_place_ty(dst));
+                    let dst_layout = bx.cx().layout_of(self.monomorphized_place_ty(dst));
                     assert!(!dst_layout.ty.has_erasable_regions());
                     let place = PlaceRef::alloca(bx, dst_layout, "transmute_temp");
                     place.storage_live(bx);
@@ -906,12 +913,12 @@ impl FunctionCx<'a, 'll, 'tcx> {
         }
     }
 
-    fn codegen_transmute_into(&mut self, bx: &Builder<'a, 'll, 'tcx>,
+    fn codegen_transmute_into(&mut self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                             src: &mir::Operand<'tcx>,
-                            dst: PlaceRef<'ll, 'tcx>) {
+                            dst: PlaceRef<'tcx, &'ll Value>) {
         let src = self.codegen_operand(bx, src);
-        let llty = src.layout.llvm_type(bx.cx);
-        let cast_ptr = bx.pointercast(dst.llval, llty.ptr_to());
+        let llty = src.layout.llvm_type(bx.cx());
+        let cast_ptr = bx.pointercast(dst.llval, bx.cx().type_ptr_to(llty));
         let align = src.layout.align.min(dst.layout.align);
         src.val.store(bx, PlaceRef::new_sized(cast_ptr, src.layout, align));
     }
@@ -919,8 +926,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
     // Stores the return value of a function call into it's final location.
     fn store_return(&mut self,
-                    bx: &Builder<'a, 'll, 'tcx>,
-                    dest: ReturnDest<'ll, 'tcx>,
+                    bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+                    dest: ReturnDest<'tcx, &'ll Value>,
                     ret_ty: &ArgType<'tcx, Ty<'tcx>>,
                     llval: &'ll Value) {
         use self::ReturnDest::*;
@@ -951,13 +958,13 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 }
 
-enum ReturnDest<'ll, 'tcx> {
+enum ReturnDest<'tcx, V> {
     // Do nothing, the return value is indirect or ignored
     Nothing,
     // Store the return value to the pointer
-    Store(PlaceRef<'ll, 'tcx>),
+    Store(PlaceRef<'tcx, V>),
     // Stores an indirect return value to an operand local place
-    IndirectOperand(PlaceRef<'ll, 'tcx>, mir::Local),
+    IndirectOperand(PlaceRef<'tcx, V>, mir::Local),
     // Stores a direct return value to an operand local place
     DirectOperand(mir::Local)
 }

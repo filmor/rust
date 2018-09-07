@@ -10,12 +10,13 @@
 
 use abi::{FnType, FnTypeExt};
 use callee;
-use common::*;
+use context::CodegenCx;
 use builder::Builder;
 use consts;
 use monomorphize;
-use type_::Type;
 use value::Value;
+
+use interfaces::{BuilderMethods, ConstMethods, TypeMethods};
 
 use rustc::ty::{self, Ty};
 use rustc::ty::layout::HasDataLayout;
@@ -33,28 +34,41 @@ impl<'a, 'tcx> VirtualIndex {
         VirtualIndex(index as u64 + 3)
     }
 
-    pub fn get_fn(self, bx: &Builder<'a, 'll, 'tcx>,
+    pub fn get_fn(self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                   llvtable: &'ll Value,
                   fn_ty: &FnType<'tcx, Ty<'tcx>>) -> &'ll Value {
         // Load the data pointer from the object.
         debug!("get_fn({:?}, {:?})", llvtable, self);
 
-        let llvtable = bx.pointercast(llvtable, fn_ty.llvm_type(bx.cx).ptr_to().ptr_to());
+        let llvtable = bx.pointercast(
+            llvtable,
+            bx.cx().type_ptr_to(bx.cx().type_ptr_to(fn_ty.llvm_type(bx.cx())))
+        );
         let ptr_align = bx.tcx().data_layout.pointer_align;
-        let ptr = bx.load(bx.inbounds_gep(llvtable, &[C_usize(bx.cx, self.0)]), ptr_align);
+        let ptr = bx.load(
+            bx.inbounds_gep(llvtable, &[bx.cx().const_usize(self.0)]),
+            ptr_align
+        );
         bx.nonnull_metadata(ptr);
         // Vtable loads are invariant
         bx.set_invariant_load(ptr);
         ptr
     }
 
-    pub fn get_usize(self, bx: &Builder<'a, 'll, 'tcx>, llvtable: &'ll Value) -> &'ll Value {
+    pub fn get_usize(
+        self,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        llvtable: &'ll Value
+    ) -> &'ll Value {
         // Load the data pointer from the object.
         debug!("get_int({:?}, {:?})", llvtable, self);
 
-        let llvtable = bx.pointercast(llvtable, Type::isize(bx.cx).ptr_to());
+        let llvtable = bx.pointercast(llvtable, bx.cx().type_ptr_to(bx.cx().type_isize()));
         let usize_align = bx.tcx().data_layout.pointer_align;
-        let ptr = bx.load(bx.inbounds_gep(llvtable, &[C_usize(bx.cx, self.0)]), usize_align);
+        let ptr = bx.load(
+            bx.inbounds_gep(llvtable, &[bx.cx().const_usize(self.0)]),
+            usize_align
+        );
         // Vtable loads are invariant
         bx.set_invariant_load(ptr);
         ptr
@@ -70,7 +84,7 @@ impl<'a, 'tcx> VirtualIndex {
 /// making an object `Foo<Trait>` from a value of type `Foo<T>`, then
 /// `trait_ref` would map `T:Trait`.
 pub fn get_vtable(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     ty: Ty<'tcx>,
     trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
 ) -> &'ll Value {
@@ -84,13 +98,13 @@ pub fn get_vtable(
     }
 
     // Not in the cache. Build it.
-    let nullptr = C_null(Type::i8p(cx));
+    let nullptr = cx.const_null(cx.type_i8p());
 
     let (size, align) = cx.size_and_align_of(ty);
     let mut components: Vec<_> = [
         callee::get_fn(cx, monomorphize::resolve_drop_in_place(cx.tcx, ty)),
-        C_usize(cx, size.bytes()),
-        C_usize(cx, align.abi())
+        cx.const_usize(size.bytes()),
+        cx.const_usize(align.abi())
     ].iter().cloned().collect();
 
     if let Some(trait_ref) = trait_ref {
@@ -104,7 +118,7 @@ pub fn get_vtable(
         components.extend(methods);
     }
 
-    let vtable_const = C_struct(cx, &components, false);
+    let vtable_const = cx.const_struct(&components, false);
     let align = cx.data_layout().pointer_align;
     let vtable = consts::addr_of(cx, vtable_const, align, Some("vtable"));
 

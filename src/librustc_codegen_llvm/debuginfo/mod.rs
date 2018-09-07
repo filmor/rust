@@ -45,6 +45,7 @@ use syntax_pos::{self, Span, Pos};
 use syntax::ast;
 use syntax::symbol::{Symbol, InternedString};
 use rustc::ty::layout::{self, LayoutOf};
+use interfaces::BuilderMethods;
 
 pub mod gdb;
 mod utils;
@@ -158,7 +159,7 @@ pub enum VariableKind {
 }
 
 /// Create any deferred debug metadata nodes
-pub fn finalize(cx: &CodegenCx) {
+pub fn finalize(cx: &CodegenCx<'ll, '_, &'ll Value>) {
     if cx.dbg_cx.is_none() {
         return;
     }
@@ -209,7 +210,7 @@ pub fn finalize(cx: &CodegenCx) {
 /// FunctionDebugContext enum which indicates why no debuginfo should be created
 /// for the function.
 pub fn create_function_debug_context(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     instance: Instance<'tcx>,
     sig: ty::FnSig<'tcx>,
     llfn: &'ll Value,
@@ -312,7 +313,7 @@ pub fn create_function_debug_context(
     return FunctionDebugContext::RegularContext(fn_debug_context);
 
     fn get_function_signature(
-        cx: &CodegenCx<'ll, 'tcx>,
+        cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
         sig: ty::FnSig<'tcx>,
     ) -> &'ll DIArray {
         if cx.sess().opts.debuginfo == DebugInfo::Limited {
@@ -375,7 +376,7 @@ pub fn create_function_debug_context(
     }
 
     fn get_template_parameters(
-        cx: &CodegenCx<'ll, 'tcx>,
+        cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
         generics: &ty::Generics,
         substs: &Substs<'tcx>,
         file_metadata: &'ll DIFile,
@@ -431,7 +432,7 @@ pub fn create_function_debug_context(
         return create_DIArray(DIB(cx), &template_params[..]);
     }
 
-    fn get_parameter_names(cx: &CodegenCx,
+    fn get_parameter_names(cx: &CodegenCx<'ll, '_, &'ll Value>,
                            generics: &ty::Generics)
                            -> Vec<InternedString> {
         let mut names = generics.parent.map_or(vec![], |def_id| {
@@ -442,7 +443,7 @@ pub fn create_function_debug_context(
     }
 
     fn get_containing_scope(
-        cx: &CodegenCx<'ll, 'tcx>,
+        cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
         instance: Instance<'tcx>,
     ) -> &'ll DIScope {
         // First, let's see if this is a method within an inherent impl. Because
@@ -485,7 +486,7 @@ pub fn create_function_debug_context(
 }
 
 pub fn declare_local(
-    bx: &Builder<'a, 'll, 'tcx>,
+    bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
     dbg_context: &FunctionDebugContext<'ll>,
     variable_name: ast::Name,
     variable_type: Ty<'tcx>,
@@ -495,7 +496,7 @@ pub fn declare_local(
     span: Span,
 ) {
     assert!(!dbg_context.get_ref(span).source_locations_enabled.get());
-    let cx = bx.cx;
+    let cx = bx.cx();
 
     let file = span_start(cx, span).file;
     let file_metadata = file_metadata(cx,

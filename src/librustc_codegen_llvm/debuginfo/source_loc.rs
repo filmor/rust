@@ -17,16 +17,18 @@ use super::FunctionDebugContext;
 use llvm;
 use llvm::debuginfo::DIScope;
 use builder::Builder;
+use interfaces::BuilderMethods;
 
 use libc::c_uint;
 use syntax_pos::{Span, Pos};
+use value::Value;
 
 /// Sets the current debug location at the beginning of the span.
 ///
 /// Maps to a call to llvm::LLVMSetCurrentDebugLocation(...).
 pub fn set_source_location(
     debug_context: &FunctionDebugContext<'ll>,
-    bx: &Builder<'_, 'll, '_>,
+    bx: &Builder<'_, 'll, '_, &'ll Value>,
     scope: Option<&'ll DIScope>,
     span: Span,
 ) {
@@ -41,7 +43,7 @@ pub fn set_source_location(
 
     let dbg_loc = if function_debug_context.source_locations_enabled.get() {
         debug!("set_source_location: {}", bx.sess().source_map().span_to_string(span));
-        let loc = span_start(bx.cx, span);
+        let loc = span_start(bx.cx(), span);
         InternalDebugLocation::new(scope.unwrap(), loc.line, loc.col.to_usize())
     } else {
         UnknownLocation
@@ -81,13 +83,16 @@ impl InternalDebugLocation<'ll> {
     }
 }
 
-pub fn set_debug_location(bx: &Builder<'_, 'll, '_>, debug_location: InternalDebugLocation<'ll>) {
+pub fn set_debug_location(
+    bx: &Builder<'_, 'll, '_, &'ll Value>,
+    debug_location: InternalDebugLocation<'ll>
+) {
     let metadata_node = match debug_location {
         KnownLocation { scope, line, col } => {
             // For MSVC, set the column number to zero.
             // Otherwise, emit it. This mimics clang behaviour.
             // See discussion in https://github.com/rust-lang/rust/issues/42921
-            let col_used =  if bx.cx.sess().target.target.options.is_like_msvc {
+            let col_used =  if bx.cx().sess().target.target.options.is_like_msvc {
                 UNKNOWN_COLUMN_NUMBER
             } else {
                 col as c_uint
@@ -96,7 +101,7 @@ pub fn set_debug_location(bx: &Builder<'_, 'll, '_>, debug_location: InternalDeb
 
             unsafe {
                 Some(llvm::LLVMRustDIBuilderCreateDebugLocation(
-                    debug_context(bx.cx).llcontext,
+                    debug_context(bx.cx()).llcontext,
                     line as c_uint,
                     col_used,
                     scope,

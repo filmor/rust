@@ -8,7 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use common::{C_i32, C_null};
 use libc::c_uint;
 use llvm::{self, BasicBlock};
 use llvm::debuginfo::DIScope;
@@ -23,8 +22,8 @@ use common::{CodegenCx, Funclet};
 use debuginfo::{self, declare_local, VariableAccess, VariableKind, FunctionDebugContext};
 use monomorphize::Instance;
 use abi::{ArgTypeExt, FnType, FnTypeExt, PassMode};
-use type_::Type;
 use value::Value;
+use interfaces::{BuilderMethods, ConstMethods};
 
 use syntax_pos::{DUMMY_SP, NO_EXPANSION, BytePos, Span};
 use syntax::symbol::keywords;
@@ -43,16 +42,16 @@ use rustc::mir::traversal;
 use self::operand::{OperandRef, OperandValue};
 
 /// Master context for codegenning from MIR.
-pub struct FunctionCx<'a, 'll: 'a, 'tcx: 'll> {
+pub struct FunctionCx<'a, 'll: 'a, 'tcx: 'll, V> {
     instance: Instance<'tcx>,
 
     mir: &'a mir::Mir<'tcx>,
 
     debug_context: FunctionDebugContext<'ll>,
 
-    llfn: &'ll Value,
+    llfn: V,
 
-    cx: &'a CodegenCx<'ll, 'tcx>,
+    cx: &'a CodegenCx<'ll, 'tcx, &'ll Value>,
 
     fn_ty: FnType<'tcx, Ty<'tcx>>,
 
@@ -63,7 +62,7 @@ pub struct FunctionCx<'a, 'll: 'a, 'tcx: 'll> {
     /// don't really care about it very much. Anyway, this value
     /// contains an alloca into which the personality is stored and
     /// then later loaded when generating the DIVERGE_BLOCK.
-    personality_slot: Option<PlaceRef<'ll, 'tcx>>,
+    personality_slot: Option<PlaceRef<'tcx, V>>,
 
     /// A `Block` for each MIR `BasicBlock`
     blocks: IndexVec<mir::BasicBlock, &'ll BasicBlock>,
@@ -72,7 +71,8 @@ pub struct FunctionCx<'a, 'll: 'a, 'tcx: 'll> {
     cleanup_kinds: IndexVec<mir::BasicBlock, analyze::CleanupKind>,
 
     /// When targeting MSVC, this stores the cleanup info for each funclet
-    /// BB. This is initialized as we compute the funclets' head block in RPO.
+    /// BB. Thisrustup component add rustfmt-preview is initialized as we compute the funclets'
+    /// head block in RPO.
     funclets: &'a IndexVec<mir::BasicBlock, Option<Funclet<'ll>>>,
 
     /// This stores the landing-pad block for a given BB, computed lazily on GNU
@@ -97,7 +97,7 @@ pub struct FunctionCx<'a, 'll: 'a, 'tcx: 'll> {
     ///
     /// Avoiding allocs can also be important for certain intrinsics,
     /// notably `expect`.
-    locals: IndexVec<mir::Local, LocalRef<'ll, 'tcx>>,
+    locals: IndexVec<mir::Local, LocalRef<'tcx, V>>,
 
     /// Debug information for MIR scopes.
     scopes: IndexVec<mir::SourceScope, debuginfo::MirDebugScope<'ll>>,
@@ -106,7 +106,7 @@ pub struct FunctionCx<'a, 'll: 'a, 'tcx: 'll> {
     param_substs: &'tcx Substs<'tcx>,
 }
 
-impl FunctionCx<'a, 'll, 'tcx> {
+impl FunctionCx<'a, 'll, 'tcx, &'ll Value> {
     pub fn monomorphize<T>(&self, value: &T) -> T
         where T: TypeFoldable<'tcx>
     {
@@ -117,7 +117,11 @@ impl FunctionCx<'a, 'll, 'tcx> {
         )
     }
 
-    pub fn set_debug_loc(&mut self, bx: &Builder<'_, 'll, '_>, source_info: mir::SourceInfo) {
+    pub fn set_debug_loc(
+        &mut self,
+        bx: &Builder<'_, 'll, '_, &'ll Value>,
+        source_info: mir::SourceInfo
+    ) {
         let (scope, span) = self.debug_loc(source_info);
         debuginfo::set_source_location(&self.debug_context, bx, scope, span);
     }
@@ -178,18 +182,21 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 }
 
-enum LocalRef<'ll, 'tcx> {
-    Place(PlaceRef<'ll, 'tcx>),
+enum LocalRef<'tcx, V> {
+    Place(PlaceRef<'tcx, V>),
     /// `UnsizedPlace(p)`: `p` itself is a thin pointer (indirect place).
     /// `*p` is the fat pointer that references the actual unsized place.
     /// Every time it is initialized, we have to reallocate the place
     /// and update the fat pointer. That's the reason why it is indirect.
-    UnsizedPlace(PlaceRef<'ll, 'tcx>),
-    Operand(Option<OperandRef<'ll, 'tcx>>),
+    UnsizedPlace(PlaceRef<'tcx, V>),
+    Operand(Option<OperandRef<'tcx, V>>),
 }
 
-impl LocalRef<'ll, 'tcx> {
-    fn new_operand(cx: &CodegenCx<'ll, 'tcx>, layout: TyLayout<'tcx>) -> LocalRef<'ll, 'tcx> {
+impl LocalRef<'tcx, &'ll Value> {
+    fn new_operand(
+        cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
+        layout: TyLayout<'tcx>
+    ) -> LocalRef<'tcx, &'ll Value> {
         if layout.is_zst() {
             // Zero-size temporaries aren't always initialized, which
             // doesn't matter because they don't contain data, but
@@ -204,7 +211,7 @@ impl LocalRef<'ll, 'tcx> {
 ///////////////////////////////////////////////////////////////////////////
 
 pub fn codegen_mir(
-    cx: &'a CodegenCx<'ll, 'tcx>,
+    cx: &'a CodegenCx<'ll, 'tcx, &'ll Value>,
     llfn: &'ll Value,
     mir: &'a Mir<'tcx>,
     instance: Instance<'tcx>,
@@ -266,7 +273,7 @@ pub fn codegen_mir(
 
         let mut allocate_local = |local| {
             let decl = &mir.local_decls[local];
-            let layout = bx.cx.layout_of(fx.monomorphize(&decl.ty));
+            let layout = bx.cx().layout_of(fx.monomorphize(&decl.ty));
             assert!(!layout.ty.has_erasable_regions());
 
             if let Some(name) = decl.name {
@@ -276,7 +283,7 @@ pub fn codegen_mir(
 
                 if !memory_locals.contains(local) && !dbg {
                     debug!("alloc: {:?} ({}) -> operand", local, name);
-                    return LocalRef::new_operand(bx.cx, layout);
+                    return LocalRef::new_operand(bx.cx(), layout);
                 }
 
                 debug!("alloc: {:?} ({}) -> place", local, name);
@@ -318,7 +325,7 @@ pub fn codegen_mir(
                     // alloca in advance. Instead we wait until we see the
                     // definition and update the operand there.
                     debug!("alloc: {:?} -> operand", local);
-                    LocalRef::new_operand(bx.cx, layout)
+                    LocalRef::new_operand(bx.cx(), layout)
                 }
             }
         };
@@ -364,7 +371,7 @@ pub fn codegen_mir(
 
 fn create_funclets(
     mir: &'a Mir<'tcx>,
-    bx: &Builder<'a, 'll, 'tcx>,
+    bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
     cleanup_kinds: &IndexVec<mir::BasicBlock, CleanupKind>,
     block_bxs: &IndexVec<mir::BasicBlock, &'ll BasicBlock>)
     -> (IndexVec<mir::BasicBlock, Option<&'ll BasicBlock>>,
@@ -411,8 +418,8 @@ fn create_funclets(
                 // C++ personality function, but `catch (...)` has no type so
                 // it's null. The 64 here is actually a bitfield which
                 // represents that this is a catch-all block.
-                let null = C_null(Type::i8p(bx.cx));
-                let sixty_four = C_i32(bx.cx, 64);
+                let null = bx.cx().const_null(bx.cx().type_i8p());
+                let sixty_four = bx.cx().const_i32(64);
                 cleanup = cp_bx.catch_pad(cs, &[null, sixty_four, null]);
                 cp_bx.br(llbb);
             }
@@ -432,11 +439,11 @@ fn create_funclets(
 /// argument's value. As arguments are places, these are always
 /// indirect.
 fn arg_local_refs(
-    bx: &Builder<'a, 'll, 'tcx>,
-    fx: &FunctionCx<'a, 'll, 'tcx>,
+    bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+    fx: &FunctionCx<'a, 'll, 'tcx, &'ll Value>,
     scopes: &IndexVec<mir::SourceScope, debuginfo::MirDebugScope<'ll>>,
     memory_locals: &BitArray<mir::Local>,
-) -> Vec<LocalRef<'ll, 'tcx>> {
+) -> Vec<LocalRef<'tcx, &'ll Value>> {
     let mir = fx.mir;
     let tcx = bx.tcx();
     let mut idx = 0;
@@ -471,7 +478,7 @@ fn arg_local_refs(
                 _ => bug!("spread argument isn't a tuple?!")
             };
 
-            let place = PlaceRef::alloca(bx, bx.cx.layout_of(arg_ty), &name);
+            let place = PlaceRef::alloca(bx, bx.cx().layout_of(arg_ty), &name);
             for i in 0..tupled_arg_tys.len() {
                 let arg = &fx.fn_ty.args[idx];
                 idx += 1;
@@ -514,7 +521,7 @@ fn arg_local_refs(
             let local = |op| LocalRef::Operand(Some(op));
             match arg.mode {
                 PassMode::Ignore => {
-                    return local(OperandRef::new_zst(bx.cx, arg.layout));
+                    return local(OperandRef::new_zst(bx.cx(), arg.layout));
                 }
                 PassMode::Direct(_) => {
                     let llarg = llvm::get_param(bx.llfn(), llarg_idx as c_uint);
@@ -593,7 +600,7 @@ fn arg_local_refs(
             // Or is it the closure environment?
             let (closure_layout, env_ref) = match arg.layout.ty.sty {
                 ty::RawPtr(ty::TypeAndMut { ty, .. }) |
-                ty::Ref(_, ty, _)  => (bx.cx.layout_of(ty), true),
+                ty::Ref(_, ty, _)  => (bx.cx().layout_of(ty), true),
                 _ => (arg.layout, false)
             };
 
@@ -615,7 +622,7 @@ fn arg_local_refs(
             let env_alloca = !env_ref && unsafe { llvm::LLVMRustVersionMajor() < 6 };
             let env_ptr = if env_alloca {
                 let scratch = PlaceRef::alloca(bx,
-                    bx.cx.layout_of(tcx.mk_mut_ptr(arg.layout.ty)),
+                    bx.cx().layout_of(tcx.mk_mut_ptr(arg.layout.ty)),
                     "__debuginfo_env_ptr");
                 bx.store(place.llval, scratch.llval, scratch.align);
                 scratch.llval

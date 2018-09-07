@@ -25,6 +25,8 @@ use libc::{c_uint, c_int, size_t, c_char};
 use libc::{c_ulonglong, c_void};
 
 use std::marker::PhantomData;
+use common;
+use syntax;
 
 use super::RustString;
 
@@ -146,6 +148,23 @@ pub enum IntPredicate {
     IntSLE = 41,
 }
 
+impl IntPredicate {
+    pub fn from_generic(intpre: common::IntPredicate) -> Self {
+        match intpre {
+            common::IntPredicate::IntEQ => IntPredicate::IntEQ,
+            common::IntPredicate::IntNE => IntPredicate::IntNE,
+            common::IntPredicate::IntUGT => IntPredicate::IntUGT,
+            common::IntPredicate::IntUGE => IntPredicate::IntUGE,
+            common::IntPredicate::IntULT => IntPredicate::IntULT,
+            common::IntPredicate::IntULE => IntPredicate::IntULE,
+            common::IntPredicate::IntSGT => IntPredicate::IntSGT,
+            common::IntPredicate::IntSGE => IntPredicate::IntSGE,
+            common::IntPredicate::IntSLT => IntPredicate::IntSLT,
+            common::IntPredicate::IntSLE => IntPredicate::IntSLE,
+        }
+    }
+}
+
 /// LLVMRealPredicate
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -168,6 +187,29 @@ pub enum RealPredicate {
     RealPredicateTrue = 15,
 }
 
+impl RealPredicate {
+    pub fn from_generic(realpred: common::RealPredicate) -> Self {
+        match realpred {
+            common::RealPredicate::RealPredicateFalse => RealPredicate::RealPredicateFalse,
+            common::RealPredicate::RealOEQ => RealPredicate::RealOEQ,
+            common::RealPredicate::RealOGT => RealPredicate::RealOGT,
+            common::RealPredicate::RealOGE => RealPredicate::RealOGE,
+            common::RealPredicate::RealOLT => RealPredicate::RealOLT,
+            common::RealPredicate::RealOLE => RealPredicate::RealOLE,
+            common::RealPredicate::RealONE => RealPredicate::RealONE,
+            common::RealPredicate::RealORD => RealPredicate::RealORD,
+            common::RealPredicate::RealUNO => RealPredicate::RealUNO,
+            common::RealPredicate::RealUEQ => RealPredicate::RealUEQ,
+            common::RealPredicate::RealUGT => RealPredicate::RealUGT,
+            common::RealPredicate::RealUGE => RealPredicate::RealUGE,
+            common::RealPredicate::RealULT => RealPredicate::RealULT,
+            common::RealPredicate::RealULE => RealPredicate::RealULE,
+            common::RealPredicate::RealUNE => RealPredicate::RealUNE,
+            common::RealPredicate::RealPredicateTrue => RealPredicate::RealPredicateTrue
+        }
+    }
+}
+
 /// LLVMTypeKind
 #[derive(Copy, Clone, PartialEq, Debug)]
 #[repr(C)]
@@ -178,7 +220,7 @@ pub enum TypeKind {
     Double = 3,
     X86_FP80 = 4,
     FP128 = 5,
-    PPC_FP128 = 6,
+    PPc_FP128 = 6,
     Label = 7,
     Integer = 8,
     Function = 9,
@@ -208,6 +250,24 @@ pub enum AtomicRmwBinOp {
     AtomicUMin = 10,
 }
 
+impl AtomicRmwBinOp {
+    pub fn from_generic(op : common::AtomicRmwBinOp) -> Self {
+        match op {
+            common::AtomicRmwBinOp::AtomicXchg => AtomicRmwBinOp::AtomicXchg,
+            common::AtomicRmwBinOp::AtomicAdd => AtomicRmwBinOp::AtomicAdd,
+            common::AtomicRmwBinOp::AtomicSub => AtomicRmwBinOp::AtomicSub,
+            common::AtomicRmwBinOp::AtomicAnd => AtomicRmwBinOp::AtomicAnd,
+            common::AtomicRmwBinOp::AtomicNand => AtomicRmwBinOp::AtomicNand,
+            common::AtomicRmwBinOp::AtomicOr => AtomicRmwBinOp::AtomicOr,
+            common::AtomicRmwBinOp::AtomicXor => AtomicRmwBinOp::AtomicXor,
+            common::AtomicRmwBinOp::AtomicMax => AtomicRmwBinOp::AtomicMax,
+            common::AtomicRmwBinOp::AtomicMin => AtomicRmwBinOp::AtomicMin,
+            common::AtomicRmwBinOp::AtomicUMax => AtomicRmwBinOp::AtomicUMax,
+            common::AtomicRmwBinOp::AtomicUMin => AtomicRmwBinOp::AtomicUMin
+        }
+    }
+}
+
 /// LLVMAtomicOrdering
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -223,6 +283,22 @@ pub enum AtomicOrdering {
     SequentiallyConsistent = 7,
 }
 
+impl AtomicOrdering {
+    pub fn from_generic(ao : common::AtomicOrdering) -> Self {
+        match ao {
+            common::AtomicOrdering::NotAtomic => AtomicOrdering::NotAtomic,
+            common::AtomicOrdering::Unordered => AtomicOrdering::Unordered,
+            common::AtomicOrdering::Monotonic => AtomicOrdering::Monotonic,
+            common::AtomicOrdering::Acquire => AtomicOrdering::Acquire,
+            common::AtomicOrdering::Release => AtomicOrdering::Release,
+            common::AtomicOrdering::AcquireRelease => AtomicOrdering::AcquireRelease,
+            common::AtomicOrdering::SequentiallyConsistent =>
+                AtomicOrdering::SequentiallyConsistent
+        }
+    }
+}
+
+
 /// LLVMRustSynchronizationScope
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -232,6 +308,16 @@ pub enum SynchronizationScope {
     Other,
     SingleThread,
     CrossThread,
+}
+
+impl SynchronizationScope {
+    pub fn from_generic(sc : common::SynchronizationScope) -> Self {
+        match sc {
+            common::SynchronizationScope::Other => SynchronizationScope::Other,
+            common::SynchronizationScope::SingleThread => SynchronizationScope::SingleThread,
+            common::SynchronizationScope::CrossThread => SynchronizationScope::CrossThread,
+        }
+    }
 }
 
 /// LLVMRustFileType
@@ -272,6 +358,15 @@ pub enum AsmDialect {
     Other,
     Att,
     Intel,
+}
+
+impl AsmDialect {
+    pub fn from_generic(asm : syntax::ast::AsmDialect) -> Self {
+        match asm {
+            syntax::ast::AsmDialect::Att => AsmDialect::Att,
+            syntax::ast::AsmDialect::Intel => AsmDialect::Intel
+        }
+    }
 }
 
 /// LLVMRustCodeGenOptLevel

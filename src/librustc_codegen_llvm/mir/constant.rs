@@ -20,19 +20,19 @@ use rustc::ty::{self, Ty};
 use rustc::ty::layout::{self, HasDataLayout, LayoutOf, Size};
 use builder::Builder;
 use common::{CodegenCx};
-use common::{C_bytes, C_struct, C_uint_big, C_undef, C_usize};
 use consts;
 use type_of::LayoutLlvmExt;
 use type_::Type;
 use syntax::ast::Mutability;
 use syntax::source_map::Span;
 use value::Value;
+use interfaces::{BuilderMethods, ConstMethods, TypeMethods};
 
 use super::super::callee;
 use super::FunctionCx;
 
 pub fn scalar_to_llvm(
-    cx: &CodegenCx<'ll, '_>,
+    cx: &CodegenCx<'ll, '_, &'ll Value>,
     cv: Scalar,
     layout: &layout::Scalar,
     llty: &'ll Type,
@@ -41,11 +41,11 @@ pub fn scalar_to_llvm(
     match cv {
         Scalar::Bits { size: 0, .. } => {
             assert_eq!(0, layout.value.size(cx).bytes());
-            C_undef(Type::ix(cx, 0))
+            cx.const_undef(cx.type_ix(0))
         },
         Scalar::Bits { bits, size } => {
             assert_eq!(size as u64, layout.value.size(cx).bytes());
-            let llval = C_uint_big(Type::ix(cx, bitsize), bits);
+            let llval = cx.const_uint_big(cx.type_ix(bitsize), bits);
             if layout.value == layout::Pointer {
                 unsafe { llvm::LLVMConstIntToPtr(llval, llty) }
             } else {
@@ -73,8 +73,8 @@ pub fn scalar_to_llvm(
                 None => bug!("missing allocation {:?}", ptr.alloc_id),
             };
             let llval = unsafe { llvm::LLVMConstInBoundsGEP(
-                consts::bitcast(base_addr, Type::i8p(cx)),
-                &C_usize(cx, ptr.offset.bytes()),
+                consts::bitcast(base_addr, cx.type_i8p()),
+                &cx.const_usize(ptr.offset.bytes()),
                 1,
             ) };
             if layout.value != layout::Pointer {
@@ -86,7 +86,7 @@ pub fn scalar_to_llvm(
     }
 }
 
-pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll Value {
+pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_, &'ll Value>, alloc: &Allocation) -> &'ll Value {
     let mut llvals = Vec::with_capacity(alloc.relocations.len() + 1);
     let layout = cx.data_layout();
     let pointer_size = layout.pointer_size.bytes() as usize;
@@ -97,7 +97,7 @@ pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll 
         assert_eq!(offset as usize as u64, offset);
         let offset = offset as usize;
         if offset > next_offset {
-            llvals.push(C_bytes(cx, &alloc.bytes[next_offset..offset]));
+            llvals.push(cx.const_bytes(&alloc.bytes[next_offset..offset]));
         }
         let ptr_offset = read_target_uint(
             layout.endian,
@@ -110,19 +110,19 @@ pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll 
                 value: layout::Primitive::Pointer,
                 valid_range: 0..=!0
             },
-            Type::i8p(cx)
+            cx.type_i8p()
         ));
         next_offset = offset + pointer_size;
     }
     if alloc.bytes.len() >= next_offset {
-        llvals.push(C_bytes(cx, &alloc.bytes[next_offset ..]));
+        llvals.push(cx.const_bytes(&alloc.bytes[next_offset ..]));
     }
 
-    C_struct(cx, &llvals, true)
+    cx.const_struct(&llvals, true)
 }
 
 pub fn codegen_static_initializer(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     def_id: DefId,
 ) -> Result<(&'ll Value, &'tcx Allocation), Lrc<ConstEvalErr<'tcx>>> {
     let instance = ty::Instance::mono(cx.tcx, def_id);
@@ -140,10 +140,10 @@ pub fn codegen_static_initializer(
     Ok((const_alloc_to_llvm(cx, alloc), alloc))
 }
 
-impl FunctionCx<'a, 'll, 'tcx> {
+impl FunctionCx<'a, 'll, 'tcx, &'ll Value> {
     fn fully_evaluate(
         &mut self,
-        bx: &Builder<'a, 'll, 'tcx>,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
         constant: &'tcx ty::Const<'tcx>,
     ) -> Result<&'tcx ty::Const<'tcx>, Lrc<ConstEvalErr<'tcx>>> {
         match constant.val {
@@ -163,7 +163,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
     pub fn eval_mir_constant(
         &mut self,
-        bx: &Builder<'a, 'll, 'tcx>,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
         constant: &mir::Constant<'tcx>,
     ) -> Result<&'tcx ty::Const<'tcx>, Lrc<ConstEvalErr<'tcx>>> {
         let c = self.monomorphize(&constant.literal);
@@ -173,7 +173,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
     /// process constant containing SIMD shuffle indices
     pub fn simd_shuffle_indices(
         &mut self,
-        bx: &Builder<'a, 'll, 'tcx>,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
         span: Span,
         ty: Ty<'tcx>,
         constant: Result<&'tcx ty::Const<'tcx>, Lrc<ConstEvalErr<'tcx>>>,
@@ -195,20 +195,20 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         c,
                     )?;
                     if let Some(prim) = field.val.try_to_scalar() {
-                        let layout = bx.cx.layout_of(field_ty);
+                        let layout = bx.cx().layout_of(field_ty);
                         let scalar = match layout.abi {
                             layout::Abi::Scalar(ref x) => x,
                             _ => bug!("from_const: invalid ByVal layout: {:#?}", layout)
                         };
                         Ok(scalar_to_llvm(
-                            bx.cx, prim, scalar,
-                            layout.immediate_llvm_type(bx.cx),
+                            bx.cx(), prim, scalar,
+                            layout.immediate_llvm_type(bx.cx()),
                         ))
                     } else {
                         bug!("simd shuffle field {:?}", field)
                     }
                 }).collect();
-                let llval = C_struct(bx.cx, &values?, false);
+                let llval = bx.cx().const_struct(&values?, false);
                 Ok((llval, c.ty))
             })
             .unwrap_or_else(|e| {
@@ -218,8 +218,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 );
                 // We've errored, so we don't have to produce working code.
                 let ty = self.monomorphize(&ty);
-                let llty = bx.cx.layout_of(ty).llvm_type(bx.cx);
-                (C_undef(llty), ty)
+                let llty = bx.cx().layout_of(ty).llvm_type(bx.cx());
+                (bx.cx().const_undef(llty), ty)
             })
     }
 }

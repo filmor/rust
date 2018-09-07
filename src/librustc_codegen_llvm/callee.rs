@@ -22,6 +22,7 @@ use llvm;
 use monomorphize::Instance;
 use type_of::LayoutLlvmExt;
 use value::Value;
+use interfaces::TypeMethods;
 
 use rustc::hir::def_id::DefId;
 use rustc::ty::{self, TypeFoldable};
@@ -36,7 +37,7 @@ use rustc::ty::subst::Substs;
 /// - `cx`: the crate context
 /// - `instance`: the instance to be instantiated
 pub fn get_fn(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     instance: Instance<'tcx>,
 ) -> &'ll Value {
     let tcx = cx.tcx;
@@ -83,7 +84,7 @@ pub fn get_fn(
         // This can occur on either a crate-local or crate-external
         // reference. It also occurs when testing libcore and in some
         // other weird situations. Annoying.
-        if common::val_ty(llfn) != llptrty {
+        if cx.val_ty(llfn) != llptrty {
             debug!("get_fn: casting {:?} to {:?}", llfn, llptrty);
             consts::ptrcast(llfn, llptrty)
         } else {
@@ -92,7 +93,7 @@ pub fn get_fn(
         }
     } else {
         let llfn = declare::declare_fn(cx, &sym, fn_ty);
-        assert_eq!(common::val_ty(llfn), llptrty);
+        assert_eq!(cx.val_ty(llfn), llptrty);
         debug!("get_fn: not casting pointer!");
 
         if instance.def.is_inline(tcx) {
@@ -206,7 +207,7 @@ pub fn get_fn(
 }
 
 pub fn resolve_and_get_fn(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     def_id: DefId,
     substs: &'tcx Substs<'tcx>,
 ) -> &'ll Value {

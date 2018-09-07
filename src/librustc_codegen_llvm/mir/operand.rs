@@ -17,12 +17,13 @@ use rustc_data_structures::indexed_vec::Idx;
 use rustc_data_structures::sync::Lrc;
 
 use base;
-use common::{CodegenCx, C_undef, C_usize};
+use common::CodegenCx;
 use builder::{Builder, MemFlags};
 use value::Value;
 use type_of::LayoutLlvmExt;
-use type_::Type;
 use glue;
+
+use interfaces::{BuilderMethods, ConstMethods, TypeMethods};
 
 use std::fmt;
 
@@ -34,16 +35,16 @@ use super::place::PlaceRef;
 /// uniquely determined by the value's type, but is kept as a
 /// safety check.
 #[derive(Copy, Clone, Debug)]
-pub enum OperandValue<'ll> {
+pub enum OperandValue<V> {
     /// A reference to the actual operand. The data is guaranteed
     /// to be valid for the operand's lifetime.
     /// The second value, if any, is the extra data (vtable or length)
     /// which indicates that it refers to an unsized rvalue.
-    Ref(&'ll Value, Option<&'ll Value>, Align),
+    Ref(V, Option<V>, Align),
     /// A single LLVM value.
-    Immediate(&'ll Value),
+    Immediate(V),
     /// A pair of immediate LLVM values. Used by fat pointers too.
-    Pair(&'ll Value, &'ll Value)
+    Pair(V, V)
 }
 
 /// An `OperandRef` is an "SSA" reference to a Rust value, along with
@@ -55,37 +56,37 @@ pub enum OperandValue<'ll> {
 /// directly is sure to cause problems -- use `OperandRef::store`
 /// instead.
 #[derive(Copy, Clone)]
-pub struct OperandRef<'ll, 'tcx> {
+pub struct OperandRef<'tcx, V> {
     // The value.
-    pub val: OperandValue<'ll>,
+    pub val: OperandValue<V>,
 
     // The layout of value, based on its Rust type.
     pub layout: TyLayout<'tcx>,
 }
 
-impl fmt::Debug for OperandRef<'ll, 'tcx> {
+impl fmt::Debug for OperandRef<'tcx, &'ll Value> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "OperandRef({:?} @ {:?})", self.val, self.layout)
     }
 }
 
-impl OperandRef<'ll, 'tcx> {
-    pub fn new_zst(cx: &CodegenCx<'ll, 'tcx>,
-                   layout: TyLayout<'tcx>) -> OperandRef<'ll, 'tcx> {
+impl OperandRef<'tcx, &'ll Value> {
+    pub fn new_zst(cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
+                   layout: TyLayout<'tcx>) -> OperandRef<'tcx, &'ll Value> {
         assert!(layout.is_zst());
         OperandRef {
-            val: OperandValue::Immediate(C_undef(layout.immediate_llvm_type(cx))),
+            val: OperandValue::Immediate(cx.const_undef(layout.immediate_llvm_type(cx))),
             layout
         }
     }
 
-    pub fn from_const(bx: &Builder<'a, 'll, 'tcx>,
+    pub fn from_const(bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                       val: &'tcx ty::Const<'tcx>)
-                      -> Result<OperandRef<'ll, 'tcx>, Lrc<ConstEvalErr<'tcx>>> {
-        let layout = bx.cx.layout_of(val.ty);
+                      -> Result<OperandRef<'tcx, &'ll Value>, Lrc<ConstEvalErr<'tcx>>> {
+        let layout = bx.cx().layout_of(val.ty);
 
         if layout.is_zst() {
-            return Ok(OperandRef::new_zst(bx.cx, layout));
+            return Ok(OperandRef::new_zst(bx.cx(), layout));
         }
 
         let val = match val.val {
@@ -96,10 +97,10 @@ impl OperandRef<'ll, 'tcx> {
                     _ => bug!("from_const: invalid ByVal layout: {:#?}", layout)
                 };
                 let llval = scalar_to_llvm(
-                    bx.cx,
+                    bx.cx(),
                     x,
                     scalar,
-                    layout.immediate_llvm_type(bx.cx),
+                    layout.immediate_llvm_type(bx.cx()),
                 );
                 OperandValue::Immediate(llval)
             },
@@ -109,20 +110,20 @@ impl OperandRef<'ll, 'tcx> {
                     _ => bug!("from_const: invalid ScalarPair layout: {:#?}", layout)
                 };
                 let a_llval = scalar_to_llvm(
-                    bx.cx,
+                    bx.cx(),
                     a,
                     a_scalar,
-                    layout.scalar_pair_element_llvm_type(bx.cx, 0, true),
+                    layout.scalar_pair_element_llvm_type(bx.cx(), 0, true),
                 );
-                let b_layout = layout.scalar_pair_element_llvm_type(bx.cx, 1, true);
+                let b_layout = layout.scalar_pair_element_llvm_type(bx.cx(), 1, true);
                 let b_llval = match b {
                     ScalarMaybeUndef::Scalar(b) => scalar_to_llvm(
-                        bx.cx,
+                        bx.cx(),
                         b,
                         b_scalar,
                         b_layout,
                     ),
-                    ScalarMaybeUndef::Undef => C_undef(b_layout),
+                    ScalarMaybeUndef::Undef => bx.cx().const_undef(b_layout),
                 };
                 OperandValue::Pair(a_llval, b_llval)
             },
@@ -146,7 +147,7 @@ impl OperandRef<'ll, 'tcx> {
         }
     }
 
-    pub fn deref(self, cx: &CodegenCx<'ll, 'tcx>) -> PlaceRef<'ll, 'tcx> {
+    pub fn deref(self, cx: &CodegenCx<'ll, 'tcx, &'ll Value>) -> PlaceRef<'tcx, &'ll Value> {
         let projected_ty = self.layout.ty.builtin_deref(true)
             .unwrap_or_else(|| bug!("deref of non-pointer {:?}", self)).ty;
         let (llptr, llextra) = match self.val {
@@ -165,13 +166,13 @@ impl OperandRef<'ll, 'tcx> {
 
     /// If this operand is a `Pair`, we return an aggregate with the two values.
     /// For other cases, see `immediate`.
-    pub fn immediate_or_packed_pair(self, bx: &Builder<'a, 'll, 'tcx>) -> &'ll Value {
+    pub fn immediate_or_packed_pair(self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>) -> &'ll Value {
         if let OperandValue::Pair(a, b) = self.val {
-            let llty = self.layout.llvm_type(bx.cx);
+            let llty = self.layout.llvm_type(bx.cx());
             debug!("Operand::immediate_or_packed_pair: packing {:?} into {:?}",
                    self, llty);
             // Reconstruct the immediate aggregate.
-            let mut llpair = C_undef(llty);
+            let mut llpair = bx.cx().const_undef(llty);
             llpair = bx.insert_value(llpair, base::from_immediate(bx, a), 0);
             llpair = bx.insert_value(llpair, base::from_immediate(bx, b), 1);
             llpair
@@ -181,10 +182,10 @@ impl OperandRef<'ll, 'tcx> {
     }
 
     /// If the type is a pair, we return a `Pair`, otherwise, an `Immediate`.
-    pub fn from_immediate_or_packed_pair(bx: &Builder<'a, 'll, 'tcx>,
+    pub fn from_immediate_or_packed_pair(bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                                          llval: &'ll Value,
                                          layout: TyLayout<'tcx>)
-                                         -> OperandRef<'ll, 'tcx> {
+                                         -> OperandRef<'tcx, &'ll Value> {
         let val = if let layout::Abi::ScalarPair(ref a, ref b) = layout.abi {
             debug!("Operand::from_immediate_or_packed_pair: unpacking {:?} @ {:?}",
                     llval, layout);
@@ -199,14 +200,17 @@ impl OperandRef<'ll, 'tcx> {
         OperandRef { val, layout }
     }
 
-    pub fn extract_field(&self, bx: &Builder<'a, 'll, 'tcx>, i: usize) -> OperandRef<'ll, 'tcx> {
-        let field = self.layout.field(bx.cx, i);
+    pub fn extract_field(
+        &self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        i: usize
+    ) -> OperandRef<'tcx, &'ll Value> {
+        let field = self.layout.field(bx.cx(), i);
         let offset = self.layout.fields.offset(i);
 
         let mut val = match (self.val, &self.layout.abi) {
             // If the field is ZST, it has no data.
             _ if field.is_zst() => {
-                return OperandRef::new_zst(bx.cx, field);
+                return OperandRef::new_zst(bx.cx(), field);
             }
 
             // Newtype of a scalar, scalar pair or vector.
@@ -219,12 +223,12 @@ impl OperandRef<'ll, 'tcx> {
             // Extract a scalar component from a pair.
             (OperandValue::Pair(a_llval, b_llval), &layout::Abi::ScalarPair(ref a, ref b)) => {
                 if offset.bytes() == 0 {
-                    assert_eq!(field.size, a.value.size(bx.cx));
+                    assert_eq!(field.size, a.value.size(bx.cx()));
                     OperandValue::Immediate(a_llval)
                 } else {
-                    assert_eq!(offset, a.value.size(bx.cx)
-                        .abi_align(b.value.align(bx.cx)));
-                    assert_eq!(field.size, b.value.size(bx.cx));
+                    assert_eq!(offset, a.value.size(bx.cx())
+                        .abi_align(b.value.align(bx.cx())));
+                    assert_eq!(field.size, b.value.size(bx.cx()));
                     OperandValue::Immediate(b_llval)
                 }
             }
@@ -232,7 +236,7 @@ impl OperandRef<'ll, 'tcx> {
             // `#[repr(simd)]` types are also immediate.
             (OperandValue::Immediate(llval), &layout::Abi::Vector { .. }) => {
                 OperandValue::Immediate(
-                    bx.extract_element(llval, C_usize(bx.cx, i as u64)))
+                    bx.extract_element(llval, bx.cx().const_usize(i as u64)))
             }
 
             _ => bug!("OperandRef::extract_field({:?}): not applicable", self)
@@ -241,11 +245,11 @@ impl OperandRef<'ll, 'tcx> {
         // HACK(eddyb) have to bitcast pointers until LLVM removes pointee types.
         match val {
             OperandValue::Immediate(ref mut llval) => {
-                *llval = bx.bitcast(*llval, field.immediate_llvm_type(bx.cx));
+                *llval = bx.bitcast(*llval, field.immediate_llvm_type(bx.cx()));
             }
             OperandValue::Pair(ref mut a, ref mut b) => {
-                *a = bx.bitcast(*a, field.scalar_pair_element_llvm_type(bx.cx, 0, true));
-                *b = bx.bitcast(*b, field.scalar_pair_element_llvm_type(bx.cx, 1, true));
+                *a = bx.bitcast(*a, field.scalar_pair_element_llvm_type(bx.cx(), 0, true));
+                *b = bx.bitcast(*b, field.scalar_pair_element_llvm_type(bx.cx(), 1, true));
             }
             OperandValue::Ref(..) => bug!()
         }
@@ -257,27 +261,41 @@ impl OperandRef<'ll, 'tcx> {
     }
 }
 
-impl OperandValue<'ll> {
-    pub fn store(self, bx: &Builder<'a, 'll, 'tcx>, dest: PlaceRef<'ll, 'tcx>) {
+impl OperandValue<&'ll Value> {
+    pub fn store(self, bx: &Builder<'a, 'll, 'tcx, &'ll Value>, dest: PlaceRef<'tcx, &'ll Value>) {
         self.store_with_flags(bx, dest, MemFlags::empty());
     }
 
-    pub fn volatile_store(self, bx: &Builder<'a, 'll, 'tcx>, dest: PlaceRef<'ll, 'tcx>) {
+    pub fn volatile_store(
+        self,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        dest: PlaceRef<'tcx, &'ll Value>
+    ) {
         self.store_with_flags(bx, dest, MemFlags::VOLATILE);
     }
 
-    pub fn unaligned_volatile_store(self, bx: &Builder<'a, 'll, 'tcx>, dest: PlaceRef<'ll, 'tcx>) {
+    pub fn unaligned_volatile_store(
+        self,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        dest: PlaceRef<'tcx, &'ll Value>
+    ) {
         self.store_with_flags(bx, dest, MemFlags::VOLATILE | MemFlags::UNALIGNED);
     }
+}
 
-    pub fn nontemporal_store(self, bx: &Builder<'a, 'll, 'tcx>, dest: PlaceRef<'ll, 'tcx>) {
+impl<'a, 'll: 'a, 'tcx: 'll> OperandValue<&'ll Value> {
+    pub fn nontemporal_store(
+        self,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        dest: PlaceRef<'tcx, &'ll Value>
+    ) {
         self.store_with_flags(bx, dest, MemFlags::NONTEMPORAL);
     }
 
     fn store_with_flags(
         self,
-        bx: &Builder<'a, 'll, 'tcx>,
-        dest: PlaceRef<'ll, 'tcx>,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        dest: PlaceRef<'tcx, &'ll Value>,
         flags: MemFlags,
     ) {
         debug!("OperandRef::store: operand={:?}, dest={:?}", self, dest);
@@ -307,8 +325,14 @@ impl OperandValue<'ll> {
             }
         }
     }
+}
 
-    pub fn store_unsized(self, bx: &Builder<'a, 'll, 'tcx>, indirect_dest: PlaceRef<'ll, 'tcx>) {
+impl OperandValue<&'ll Value> {
+    pub fn store_unsized(
+        self,
+        bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+        indirect_dest: PlaceRef<'tcx, &'ll Value>
+    ) {
         debug!("OperandRef::store_unsized: operand={:?}, indirect_dest={:?}", self, indirect_dest);
         let flags = MemFlags::empty();
 
@@ -328,21 +352,21 @@ impl OperandValue<'ll> {
         let min_align = Align::from_bits(8, 8).unwrap();
 
         // Allocate an appropriate region on the stack, and copy the value into it
-        let (llsize, _) = glue::size_and_align_of_dst(&bx, unsized_ty, Some(llextra));
-        let lldst = bx.array_alloca(Type::i8(bx.cx), llsize, "unsized_tmp", max_align);
-        base::call_memcpy(&bx, lldst, llptr, llsize, min_align, flags);
+        let (llsize, _) = glue::size_and_align_of_dst(bx, unsized_ty, Some(llextra));
+        let lldst = bx.array_alloca(bx.cx().type_i8(), llsize, "unsized_tmp", max_align);
+        base::call_memcpy(bx, lldst, llptr, llsize, min_align, flags);
 
         // Store the allocated region and the extra to the indirect place.
         let indirect_operand = OperandValue::Pair(lldst, llextra);
-        indirect_operand.store(&bx, indirect_dest);
+        indirect_operand.store(bx, indirect_dest);
     }
 }
 
-impl FunctionCx<'a, 'll, 'tcx> {
+impl FunctionCx<'a, 'll, 'tcx, &'ll Value> {
     fn maybe_codegen_consume_direct(&mut self,
-                                  bx: &Builder<'a, 'll, 'tcx>,
+                                  bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                                   place: &mir::Place<'tcx>)
-                                   -> Option<OperandRef<'ll, 'tcx>>
+                                   -> Option<OperandRef<'tcx, &'ll Value>>
     {
         debug!("maybe_codegen_consume_direct(place={:?})", place);
 
@@ -374,9 +398,9 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         // ZSTs don't require any actual memory access.
                         // FIXME(eddyb) deduplicate this with the identical
                         // checks in `codegen_consume` and `extract_field`.
-                        let elem = o.layout.field(bx.cx, 0);
+                        let elem = o.layout.field(bx.cx(), 0);
                         if elem.is_zst() {
-                            return Some(OperandRef::new_zst(bx.cx, elem));
+                            return Some(OperandRef::new_zst(bx.cx(), elem));
                         }
                     }
                     _ => {}
@@ -388,18 +412,18 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     pub fn codegen_consume(&mut self,
-                         bx: &Builder<'a, 'll, 'tcx>,
+                         bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                          place: &mir::Place<'tcx>)
-                         -> OperandRef<'ll, 'tcx>
+                         -> OperandRef<'tcx, &'ll Value>
     {
         debug!("codegen_consume(place={:?})", place);
 
         let ty = self.monomorphized_place_ty(place);
-        let layout = bx.cx.layout_of(ty);
+        let layout = bx.cx().layout_of(ty);
 
         // ZSTs don't require any actual memory access.
         if layout.is_zst() {
-            return OperandRef::new_zst(bx.cx, layout);
+            return OperandRef::new_zst(bx.cx(), layout);
         }
 
         if let Some(o) = self.maybe_codegen_consume_direct(bx, place) {
@@ -412,9 +436,9 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     pub fn codegen_operand(&mut self,
-                         bx: &Builder<'a, 'll, 'tcx>,
+                         bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
                          operand: &mir::Operand<'tcx>)
-                         -> OperandRef<'ll, 'tcx>
+                         -> OperandRef<'tcx, &'ll Value>
     {
         debug!("codegen_operand(operand={:?})", operand);
 
@@ -435,12 +459,12 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         );
                         // Allow RalfJ to sleep soundly knowing that even refactorings that remove
                         // the above error (or silence it under some conditions) will not cause UB
-                        let fnname = bx.cx.get_intrinsic(&("llvm.trap"));
+                        let fnname = bx.cx().get_intrinsic(&("llvm.trap"));
                         bx.call(fnname, &[], None);
                         // We've errored, so we don't have to produce working code.
-                        let layout = bx.cx.layout_of(ty);
+                        let layout = bx.cx().layout_of(ty);
                         PlaceRef::new_sized(
-                            C_undef(layout.llvm_type(bx.cx).ptr_to()),
+                            bx.cx().const_undef(bx.cx().type_ptr_to(layout.llvm_type(bx.cx()))),
                             layout,
                             layout.align,
                         ).load(bx)

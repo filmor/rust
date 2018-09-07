@@ -15,7 +15,7 @@ use rustc::hir::Node;
 use debuginfo;
 use base;
 use monomorphize::MonoItem;
-use common::{CodegenCx, val_ty};
+use common::CodegenCx;
 use declare;
 use monomorphize::Instance;
 use syntax_pos::Span;
@@ -24,6 +24,7 @@ use type_::Type;
 use type_of::LayoutLlvmExt;
 use value::Value;
 use rustc::ty::{self, Ty};
+use interfaces::TypeMethods;
 
 use rustc::ty::layout::{Align, LayoutOf};
 
@@ -43,7 +44,7 @@ pub fn bitcast(val: &'ll Value, ty: &'ll Type) -> &'ll Value {
     }
 }
 
-fn set_global_alignment(cx: &CodegenCx<'ll, '_>,
+fn set_global_alignment(cx: &CodegenCx<'ll, '_, &'ll Value>,
                         gv: &'ll Value,
                         mut align: Align) {
     // The target may require greater alignment for globals than the type does.
@@ -63,7 +64,7 @@ fn set_global_alignment(cx: &CodegenCx<'ll, '_>,
 }
 
 pub fn addr_of_mut(
-    cx: &CodegenCx<'ll, '_>,
+    cx: &CodegenCx<'ll, '_, &'ll Value>,
     cv: &'ll Value,
     align: Align,
     kind: Option<&str>,
@@ -72,13 +73,14 @@ pub fn addr_of_mut(
         let gv = match kind {
             Some(kind) if !cx.tcx.sess.fewer_names() => {
                 let name = cx.generate_local_symbol_name(kind);
-                let gv = declare::define_global(cx, &name[..], val_ty(cv)).unwrap_or_else(||{
-                    bug!("symbol `{}` is already defined", name);
+                let gv = declare::define_global(cx, &name[..],
+                    cx.val_ty(cv)).unwrap_or_else(||{
+                        bug!("symbol `{}` is already defined", name);
                 });
                 llvm::LLVMRustSetLinkage(gv, llvm::Linkage::PrivateLinkage);
                 gv
             },
-            _ => declare::define_private_global(cx, val_ty(cv)),
+            _ => declare::define_private_global(cx, cx.val_ty(cv)),
         };
         llvm::LLVMSetInitializer(gv, cv);
         set_global_alignment(cx, gv, align);
@@ -88,7 +90,7 @@ pub fn addr_of_mut(
 }
 
 pub fn addr_of(
-    cx: &CodegenCx<'ll, '_>,
+    cx: &CodegenCx<'ll, '_, &'ll Value>,
     cv: &'ll Value,
     align: Align,
     kind: Option<&str>,
@@ -112,7 +114,7 @@ pub fn addr_of(
     gv
 }
 
-pub fn get_static(cx: &CodegenCx<'ll, '_>, def_id: DefId) -> &'ll Value {
+pub fn get_static(cx: &CodegenCx<'ll, '_, &'ll Value>, def_id: DefId) -> &'ll Value {
     let instance = Instance::mono(cx.tcx, def_id);
     if let Some(&g) = cx.instances.borrow().get(&instance) {
         return g;
@@ -234,7 +236,7 @@ pub fn get_static(cx: &CodegenCx<'ll, '_>, def_id: DefId) -> &'ll Value {
 }
 
 fn check_and_apply_linkage(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     attrs: &CodegenFnAttrs,
     ty: Ty<'tcx>,
     sym: LocalInternedString,
@@ -294,7 +296,7 @@ fn check_and_apply_linkage(
 }
 
 pub fn codegen_static<'a, 'tcx>(
-    cx: &CodegenCx<'a, 'tcx>,
+    cx: &CodegenCx<'a, 'tcx, &'a Value>,
     def_id: DefId,
     is_mutable: bool,
 ) {
@@ -311,9 +313,9 @@ pub fn codegen_static<'a, 'tcx>(
 
         // boolean SSA values are i1, but they have to be stored in i8 slots,
         // otherwise some LLVM optimization passes don't work as expected
-        let mut val_llty = val_ty(v);
-        let v = if val_llty == Type::i1(cx) {
-            val_llty = Type::i8(cx);
+        let mut val_llty = cx.val_ty(v);
+        let v = if val_llty == cx.type_i1() {
+            val_llty = cx.type_i8();
             llvm::LLVMConstZExt(v, val_llty)
         } else {
             v
@@ -431,7 +433,7 @@ pub fn codegen_static<'a, 'tcx>(
 
         if attrs.flags.contains(CodegenFnAttrFlags::USED) {
             // This static will be stored in the llvm.used variable which is an array of i8*
-            let cast = llvm::LLVMConstPointerCast(g, Type::i8p(cx));
+            let cast = llvm::LLVMConstPointerCast(g, cx.type_i8p());
             cx.used_statics.borrow_mut().push(cast);
         }
     }

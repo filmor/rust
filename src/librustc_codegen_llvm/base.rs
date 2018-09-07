@@ -52,10 +52,9 @@ use mir::place::PlaceRef;
 use attributes;
 use builder::{Builder, MemFlags};
 use callee;
-use common::{C_bool, C_bytes_in_context, C_i32, C_usize};
 use rustc_mir::monomorphize::collector::{self, MonoItemCollectionMode};
 use rustc_mir::monomorphize::item::DefPathBasedNames;
-use common::{self, C_struct_in_context, C_array, val_ty};
+use common::{self, IntPredicate, RealPredicate};
 use consts;
 use context::CodegenCx;
 use debuginfo;
@@ -73,6 +72,8 @@ use rustc::util::nodemap::{FxHashMap, FxHashSet, DefIdSet};
 use CrateInfo;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_data_structures::sync::Lrc;
+
+use interfaces::{BuilderMethods, ConstMethods, TypeMethods};
 
 use std::any::Any;
 use std::ffi::CString;
@@ -93,13 +94,13 @@ use mir::operand::OperandValue;
 use rustc_codegen_utils::check_for_rustc_errors_attr;
 
 pub struct StatRecorder<'a, 'll: 'a, 'tcx: 'll> {
-    cx: &'a CodegenCx<'ll, 'tcx>,
+    cx: &'a CodegenCx<'ll, 'tcx, &'ll Value>,
     name: Option<String>,
     istart: usize,
 }
 
 impl StatRecorder<'a, 'll, 'tcx> {
-    pub fn new(cx: &'a CodegenCx<'ll, 'tcx>, name: String) -> Self {
+    pub fn new(cx: &'a CodegenCx<'ll, 'tcx, &'ll Value>, name: String) -> Self {
         let istart = cx.stats.borrow().n_llvm_insns;
         StatRecorder {
             cx,
@@ -124,14 +125,14 @@ impl Drop for StatRecorder<'a, 'll, 'tcx> {
 
 pub fn bin_op_to_icmp_predicate(op: hir::BinOpKind,
                                 signed: bool)
-                                -> llvm::IntPredicate {
+                                -> IntPredicate {
     match op {
-        hir::BinOpKind::Eq => llvm::IntEQ,
-        hir::BinOpKind::Ne => llvm::IntNE,
-        hir::BinOpKind::Lt => if signed { llvm::IntSLT } else { llvm::IntULT },
-        hir::BinOpKind::Le => if signed { llvm::IntSLE } else { llvm::IntULE },
-        hir::BinOpKind::Gt => if signed { llvm::IntSGT } else { llvm::IntUGT },
-        hir::BinOpKind::Ge => if signed { llvm::IntSGE } else { llvm::IntUGE },
+        hir::BinOpKind::Eq => IntPredicate::IntEQ,
+        hir::BinOpKind::Ne => IntPredicate::IntNE,
+        hir::BinOpKind::Lt => if signed { IntPredicate::IntSLT } else { IntPredicate::IntULT },
+        hir::BinOpKind::Le => if signed { IntPredicate::IntSLE } else { IntPredicate::IntULE },
+        hir::BinOpKind::Gt => if signed { IntPredicate::IntSGT } else { IntPredicate::IntUGT },
+        hir::BinOpKind::Ge => if signed { IntPredicate::IntSGE } else { IntPredicate::IntUGE },
         op => {
             bug!("comparison_op_to_icmp_predicate: expected comparison operator, \
                   found {:?}",
@@ -140,14 +141,14 @@ pub fn bin_op_to_icmp_predicate(op: hir::BinOpKind,
     }
 }
 
-pub fn bin_op_to_fcmp_predicate(op: hir::BinOpKind) -> llvm::RealPredicate {
+pub fn bin_op_to_fcmp_predicate(op: hir::BinOpKind) -> RealPredicate {
     match op {
-        hir::BinOpKind::Eq => llvm::RealOEQ,
-        hir::BinOpKind::Ne => llvm::RealUNE,
-        hir::BinOpKind::Lt => llvm::RealOLT,
-        hir::BinOpKind::Le => llvm::RealOLE,
-        hir::BinOpKind::Gt => llvm::RealOGT,
-        hir::BinOpKind::Ge => llvm::RealOGE,
+        hir::BinOpKind::Eq => RealPredicate::RealOEQ,
+        hir::BinOpKind::Ne => RealPredicate::RealUNE,
+        hir::BinOpKind::Lt => RealPredicate::RealOLT,
+        hir::BinOpKind::Le => RealPredicate::RealOLE,
+        hir::BinOpKind::Gt => RealPredicate::RealOGT,
+        hir::BinOpKind::Ge => RealPredicate::RealOGE,
         op => {
             bug!("comparison_op_to_fcmp_predicate: expected comparison operator, \
                   found {:?}",
@@ -156,14 +157,14 @@ pub fn bin_op_to_fcmp_predicate(op: hir::BinOpKind) -> llvm::RealPredicate {
     }
 }
 
-pub fn compare_simd_types(
-    bx: &Builder<'a, 'll, 'tcx>,
-    lhs: &'ll Value,
-    rhs: &'ll Value,
+pub fn compare_simd_types<'a, 'll:'a, 'tcx:'ll, Builder : BuilderMethods<'a, 'll, 'tcx>>(
+    bx: &Builder,
+    lhs: Builder::Value,
+    rhs: Builder::Value,
     t: Ty<'tcx>,
-    ret_ty: &'ll Type,
+    ret_ty: Builder::Type,
     op: hir::BinOpKind
-) -> &'ll Value {
+) -> Builder::Value {
     let signed = match t.sty {
         ty::Float(_) => {
             let cmp = bin_op_to_fcmp_predicate(op);
@@ -189,7 +190,7 @@ pub fn compare_simd_types(
 /// in an upcast, where the new vtable for an object will be derived
 /// from the old one.
 pub fn unsized_info(
-    cx: &CodegenCx<'ll, 'tcx>,
+    cx: &CodegenCx<'ll, 'tcx, &'ll Value>,
     source: Ty<'tcx>,
     target: Ty<'tcx>,
     old_info: Option<&'ll Value>,
@@ -197,7 +198,7 @@ pub fn unsized_info(
     let (source, target) = cx.tcx.struct_lockstep_tails(source, target);
     match (&source.sty, &target.sty) {
         (&ty::Array(_, len), &ty::Slice(_)) => {
-            C_usize(cx, len.unwrap_usize(cx.tcx))
+            cx.const_usize(len.unwrap_usize(cx.tcx))
         }
         (&ty::Dynamic(..), &ty::Dynamic(..)) => {
             // For now, upcasts are limited to changes in marker
@@ -219,7 +220,7 @@ pub fn unsized_info(
 
 /// Coerce `src` to `dst_ty`. `src_ty` must be a thin pointer.
 pub fn unsize_thin_ptr(
-    bx: &Builder<'a, 'll, 'tcx>,
+    bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
     src: &'ll Value,
     src_ty: Ty<'tcx>,
     dst_ty: Ty<'tcx>
@@ -232,24 +233,24 @@ pub fn unsize_thin_ptr(
          &ty::RawPtr(ty::TypeAndMut { ty: b, .. })) |
         (&ty::RawPtr(ty::TypeAndMut { ty: a, .. }),
          &ty::RawPtr(ty::TypeAndMut { ty: b, .. })) => {
-            assert!(bx.cx.type_is_sized(a));
-            let ptr_ty = bx.cx.layout_of(b).llvm_type(bx.cx).ptr_to();
-            (bx.pointercast(src, ptr_ty), unsized_info(bx.cx, a, b, None))
+            assert!(bx.cx().type_is_sized(a));
+            let ptr_ty = bx.cx().type_ptr_to(bx.cx().layout_of(b).llvm_type(bx.cx()));
+            (bx.pointercast(src, ptr_ty), unsized_info(bx.cx(), a, b, None))
         }
         (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) if def_a.is_box() && def_b.is_box() => {
             let (a, b) = (src_ty.boxed_ty(), dst_ty.boxed_ty());
-            assert!(bx.cx.type_is_sized(a));
-            let ptr_ty = bx.cx.layout_of(b).llvm_type(bx.cx).ptr_to();
-            (bx.pointercast(src, ptr_ty), unsized_info(bx.cx, a, b, None))
+            assert!(bx.cx().type_is_sized(a));
+            let ptr_ty = bx.cx().type_ptr_to(bx.cx().layout_of(b).llvm_type(bx.cx()));
+            (bx.pointercast(src, ptr_ty), unsized_info(bx.cx(), a, b, None))
         }
         (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {
             assert_eq!(def_a, def_b);
 
-            let src_layout = bx.cx.layout_of(src_ty);
-            let dst_layout = bx.cx.layout_of(dst_ty);
+            let src_layout = bx.cx().layout_of(src_ty);
+            let dst_layout = bx.cx().layout_of(dst_ty);
             let mut result = None;
             for i in 0..src_layout.fields.count() {
-                let src_f = src_layout.field(bx.cx, i);
+                let src_f = src_layout.field(bx.cx(), i);
                 assert_eq!(src_layout.fields.offset(i).bytes(), 0);
                 assert_eq!(dst_layout.fields.offset(i).bytes(), 0);
                 if src_f.is_zst() {
@@ -257,15 +258,15 @@ pub fn unsize_thin_ptr(
                 }
                 assert_eq!(src_layout.size, src_f.size);
 
-                let dst_f = dst_layout.field(bx.cx, i);
+                let dst_f = dst_layout.field(bx.cx(), i);
                 assert_ne!(src_f.ty, dst_f.ty);
                 assert_eq!(result, None);
                 result = Some(unsize_thin_ptr(bx, src, src_f.ty, dst_f.ty));
             }
             let (lldata, llextra) = result.unwrap();
             // HACK(eddyb) have to bitcast pointers until LLVM removes pointee types.
-            (bx.bitcast(lldata, dst_layout.scalar_pair_element_llvm_type(bx.cx, 0, true)),
-             bx.bitcast(llextra, dst_layout.scalar_pair_element_llvm_type(bx.cx, 1, true)))
+            (bx.bitcast(lldata, dst_layout.scalar_pair_element_llvm_type(bx.cx(), 0, true)),
+             bx.bitcast(llextra, dst_layout.scalar_pair_element_llvm_type(bx.cx(), 1, true)))
         }
         _ => bug!("unsize_thin_ptr: called on bad types"),
     }
@@ -274,9 +275,9 @@ pub fn unsize_thin_ptr(
 /// Coerce `src`, which is a reference to a value of type `src_ty`,
 /// to a value of type `dst_ty` and store the result in `dst`
 pub fn coerce_unsized_into(
-    bx: &Builder<'a, 'll, 'tcx>,
-    src: PlaceRef<'ll, 'tcx>,
-    dst: PlaceRef<'ll, 'tcx>
+    bx: &Builder<'a, 'll, 'tcx, &'ll Value>,
+    src: PlaceRef<'tcx, &'ll Value>,
+    dst: PlaceRef<'tcx, &'ll Value>
 ) {
     let src_ty = src.layout.ty;
     let dst_ty = dst.layout.ty;
@@ -287,8 +288,8 @@ pub fn coerce_unsized_into(
                 // i.e. &'a fmt::Debug+Send => &'a fmt::Debug
                 // So we need to pointercast the base to ensure
                 // the types match up.
-                let thin_ptr = dst.layout.field(bx.cx, abi::FAT_PTR_ADDR);
-                (bx.pointercast(base, thin_ptr.llvm_type(bx.cx)), info)
+                let thin_ptr = dst.layout.field(bx.cx(), abi::FAT_PTR_ADDR);
+                (bx.pointercast(base, thin_ptr.llvm_type(bx.cx())), info)
             }
             OperandValue::Immediate(base) => {
                 unsize_thin_ptr(bx, base, src_ty, dst_ty)
@@ -333,12 +334,13 @@ pub fn coerce_unsized_into(
 }
 
 pub fn cast_shift_expr_rhs(
-    cx: &Builder<'_, 'll, '_>, op: hir::BinOpKind, lhs: &'ll Value, rhs: &'ll Value
+    bx: &Builder<'_, 'll, '_, &'ll Value>, op: hir::BinOpKind, lhs: &'ll Value, rhs: &'ll Value
 ) -> &'ll Value {
-    cast_shift_rhs(op, lhs, rhs, |a, b| cx.trunc(a, b), |a, b| cx.zext(a, b))
+    cast_shift_rhs(bx, op, lhs, rhs, |a, b| bx.trunc(a, b), |a, b| bx.zext(a, b))
 }
 
-fn cast_shift_rhs<'ll, F, G>(op: hir::BinOpKind,
+fn cast_shift_rhs<'ll, F, G>(bx: &Builder<'_, 'll, '_, &'ll Value>,
+                        op: hir::BinOpKind,
                         lhs: &'ll Value,
                         rhs: &'ll Value,
                         trunc: F,
@@ -349,16 +351,16 @@ fn cast_shift_rhs<'ll, F, G>(op: hir::BinOpKind,
 {
     // Shifts may have any size int on the rhs
     if op.is_shift() {
-        let mut rhs_llty = val_ty(rhs);
-        let mut lhs_llty = val_ty(lhs);
-        if rhs_llty.kind() == TypeKind::Vector {
-            rhs_llty = rhs_llty.element_type()
+        let mut rhs_llty = bx.cx().val_ty(rhs);
+        let mut lhs_llty = bx.cx().val_ty(lhs);
+        if bx.cx().type_kind(rhs_llty) == TypeKind::Vector {
+            rhs_llty = bx.cx().element_type(rhs_llty)
         }
-        if lhs_llty.kind() == TypeKind::Vector {
-            lhs_llty = lhs_llty.element_type()
+        if bx.cx().type_kind(lhs_llty) == TypeKind::Vector {
+            lhs_llty = bx.cx().element_type(lhs_llty)
         }
-        let rhs_sz = rhs_llty.int_width();
-        let lhs_sz = lhs_llty.int_width();
+        let rhs_sz = bx.cx().int_width(rhs_llty);
+        let lhs_sz = bx.cx().int_width(lhs_llty);
         if lhs_sz < rhs_sz {
             trunc(rhs, lhs_llty)
         } else if lhs_sz > rhs_sz {
@@ -382,21 +384,24 @@ pub fn wants_msvc_seh(sess: &Session) -> bool {
     sess.target.target.options.is_like_msvc
 }
 
-pub fn call_assume(bx: &Builder<'_, 'll, '_>, val: &'ll Value) {
-    let assume_intrinsic = bx.cx.get_intrinsic("llvm.assume");
+pub fn call_assume(bx: &Builder<'_, 'll, '_, &'ll Value>, val: &'ll Value) {
+    let assume_intrinsic = bx.cx().get_intrinsic("llvm.assume");
     bx.call(assume_intrinsic, &[val], None);
 }
 
-pub fn from_immediate(bx: &Builder<'_, 'll, '_>, val: &'ll Value) -> &'ll Value {
-    if val_ty(val) == Type::i1(bx.cx) {
-        bx.zext(val, Type::i8(bx.cx))
+pub fn from_immediate<'a, 'll: 'a, 'tcx: 'll>(
+    bx: &Builder<'_ ,'ll, '_, &'ll Value>,
+    val: &'ll Value
+) -> &'ll Value {
+    if bx.cx().val_ty(val) == bx.cx().type_i1() {
+        bx.zext(val, bx.cx().type_i8())
     } else {
         val
     }
 }
 
 pub fn to_immediate(
-    bx: &Builder<'_, 'll, '_>,
+    bx: &Builder<'_, 'll, '_, &'ll Value>,
     val: &'ll Value,
     layout: layout::TyLayout,
 ) -> &'ll Value {
@@ -407,18 +412,18 @@ pub fn to_immediate(
 }
 
 pub fn to_immediate_scalar(
-    bx: &Builder<'_, 'll, '_>,
+    bx: &Builder<'_, 'll, '_, &'ll Value>,
     val: &'ll Value,
     scalar: &layout::Scalar,
 ) -> &'ll Value {
     if scalar.is_bool() {
-        return bx.trunc(val, Type::i1(bx.cx));
+        return bx.trunc(val, bx.cx().type_i1());
     }
     val
 }
 
-pub fn call_memcpy(
-    bx: &Builder<'_, 'll, '_>,
+pub fn call_memcpy<'a, 'll: 'a, 'tcx: 'll>(
+    bx: &Builder<'_ ,'ll, '_, &'ll Value>,
     dst: &'ll Value,
     src: &'ll Value,
     n_bytes: &'ll Value,
@@ -428,24 +433,24 @@ pub fn call_memcpy(
     if flags.contains(MemFlags::NONTEMPORAL) {
         // HACK(nox): This is inefficient but there is no nontemporal memcpy.
         let val = bx.load(src, align);
-        let ptr = bx.pointercast(dst, val_ty(val).ptr_to());
+        let ptr = bx.pointercast(dst, bx.cx().type_ptr_to(bx.cx().val_ty(val)));
         bx.store_with_flags(val, ptr, align, flags);
         return;
     }
-    let cx = bx.cx;
+    let cx = bx.cx();
     let ptr_width = &cx.sess().target.target.target_pointer_width;
     let key = format!("llvm.memcpy.p0i8.p0i8.i{}", ptr_width);
     let memcpy = cx.get_intrinsic(&key);
-    let src_ptr = bx.pointercast(src, Type::i8p(cx));
-    let dst_ptr = bx.pointercast(dst, Type::i8p(cx));
+    let src_ptr = bx.pointercast(src, cx.type_i8p());
+    let dst_ptr = bx.pointercast(dst, cx.type_i8p());
     let size = bx.intcast(n_bytes, cx.isize_ty, false);
-    let align = C_i32(cx, align.abi() as i32);
-    let volatile = C_bool(cx, flags.contains(MemFlags::VOLATILE));
+    let align = cx.const_i32(align.abi() as i32);
+    let volatile = cx.const_bool(flags.contains(MemFlags::VOLATILE));
     bx.call(memcpy, &[dst_ptr, src_ptr, size, align, volatile], None);
 }
 
-pub fn memcpy_ty(
-    bx: &Builder<'_, 'll, 'tcx>,
+pub fn memcpy_ty<'a, 'll: 'a, 'tcx: 'll>(
+    bx: &Builder<'_ ,'ll, '_, &'ll Value>,
     dst: &'ll Value,
     src: &'ll Value,
     layout: TyLayout<'tcx>,
@@ -457,25 +462,25 @@ pub fn memcpy_ty(
         return;
     }
 
-    call_memcpy(bx, dst, src, C_usize(bx.cx, size), align, flags);
+    call_memcpy(bx, dst, src, bx.cx().const_usize(size), align, flags);
 }
 
 pub fn call_memset(
-    bx: &Builder<'_, 'll, '_>,
+    bx: &Builder<'_, 'll, '_, &'ll Value>,
     ptr: &'ll Value,
     fill_byte: &'ll Value,
     size: &'ll Value,
     align: &'ll Value,
     volatile: bool,
 ) -> &'ll Value {
-    let ptr_width = &bx.cx.sess().target.target.target_pointer_width;
+    let ptr_width = &bx.cx().sess().target.target.target_pointer_width;
     let intrinsic_key = format!("llvm.memset.p0i8.i{}", ptr_width);
-    let llintrinsicfn = bx.cx.get_intrinsic(&intrinsic_key);
-    let volatile = C_bool(bx.cx, volatile);
+    let llintrinsicfn = bx.cx().get_intrinsic(&intrinsic_key);
+    let volatile = bx.cx().const_bool(volatile);
     bx.call(llintrinsicfn, &[ptr, fill_byte, size, align, volatile], None)
 }
 
-pub fn codegen_instance<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx>, instance: Instance<'tcx>) {
+pub fn codegen_instance<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx, &'a Value>, instance: Instance<'tcx>) {
     let _s = if cx.sess().codegen_stats() {
         let mut instance_name = String::new();
         DefPathBasedNames::new(cx.tcx, true, true)
@@ -518,7 +523,7 @@ pub fn set_link_section(llval: &Value, attrs: &CodegenFnAttrs) {
 
 /// Create the `main` function which will initialize the rust runtime and call
 /// users main function.
-fn maybe_create_entry_wrapper(cx: &CodegenCx) {
+fn maybe_create_entry_wrapper(cx: &CodegenCx<'ll, '_, &'ll Value>) {
     let (main_def_id, span) = match *cx.sess().entry_fn.borrow() {
         Some((id, span, _)) => {
             (cx.tcx.hir.local_def_id(id), span)
@@ -544,13 +549,14 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
     }
 
     fn create_entry_fn(
-        cx: &CodegenCx<'ll, '_>,
+        cx: &CodegenCx<'ll, '_, &'ll Value>,
         sp: Span,
         rust_main: &'ll Value,
         rust_main_def_id: DefId,
         use_start_lang_item: bool,
     ) {
-        let llfty = Type::func(&[Type::c_int(cx), Type::i8p(cx).ptr_to()], Type::c_int(cx));
+        let llfty =
+            cx.type_func(&[cx.type_int(), cx.type_ptr_to(cx.type_i8p())], cx.type_int());
 
         let main_ret_ty = cx.tcx.fn_sig(rust_main_def_id).output();
         // Given that `main()` has no arguments,
@@ -593,7 +599,7 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
                 start_def_id,
                 cx.tcx.intern_substs(&[main_ret_ty.into()]),
             );
-            (start_fn, vec![bx.pointercast(rust_main, Type::i8p(cx).ptr_to()),
+            (start_fn, vec![bx.pointercast(rust_main, cx.type_ptr_to(cx.type_i8p())),
                             arg_argc, arg_argv])
         } else {
             debug!("using user-defined start fn");
@@ -601,7 +607,7 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
         };
 
         let result = bx.call(start_fn, &args, None);
-        bx.ret(bx.intcast(result, Type::c_int(cx), true));
+        bx.ret(bx.intcast(result, cx.type_int(), true));
     }
 }
 
@@ -648,12 +654,12 @@ fn write_metadata<'a, 'gcx>(tcx: TyCtxt<'a, 'gcx, 'gcx>,
     DeflateEncoder::new(&mut compressed, Compression::fast())
         .write_all(&metadata.raw_data).unwrap();
 
-    let llmeta = C_bytes_in_context(metadata_llcx, &compressed);
-    let llconst = C_struct_in_context(metadata_llcx, &[llmeta], false);
+    let llmeta = common::bytes_in_context(metadata_llcx, &compressed);
+    let llconst = common::struct_in_context(metadata_llcx, &[llmeta], false);
     let name = exported_symbols::metadata_symbol_name(tcx);
     let buf = CString::new(name).unwrap();
     let llglobal = unsafe {
-        llvm::LLVMAddGlobal(metadata_llmod, val_ty(llconst), buf.as_ptr())
+        llvm::LLVMAddGlobal(metadata_llmod, common::val_ty(llconst), buf.as_ptr())
     };
     unsafe {
         llvm::LLVMSetInitializer(llglobal, llconst);
@@ -1241,7 +1247,7 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             // Run replace-all-uses-with for statics that need it
             for &(old_g, new_g) in cx.statics_to_rauw.borrow().iter() {
                 unsafe {
-                    let bitcast = llvm::LLVMConstPointerCast(new_g, val_ty(old_g));
+                    let bitcast = llvm::LLVMConstPointerCast(new_g, cx.val_ty(old_g));
                     llvm::LLVMReplaceAllUsesWith(old_g, bitcast);
                     llvm::LLVMDeleteGlobal(old_g);
                 }
@@ -1252,11 +1258,14 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             if !cx.used_statics.borrow().is_empty() {
                 let name = const_cstr!("llvm.used");
                 let section = const_cstr!("llvm.metadata");
-                let array = C_array(Type::i8(&cx).ptr_to(), &*cx.used_statics.borrow());
+                let array = cx.const_array(
+                    &cx.type_ptr_to(cx.type_i8()),
+                    &*cx.used_statics.borrow()
+                );
 
                 unsafe {
                     let g = llvm::LLVMAddGlobal(cx.llmod,
-                                                val_ty(array),
+                                                cx.val_ty(array),
                                                 name.as_ptr());
                     llvm::LLVMSetInitializer(g, array);
                     llvm::LLVMRustSetLinkage(g, llvm::Linkage::AppendingLinkage);
